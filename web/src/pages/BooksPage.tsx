@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Link } from 'react-router'
+import { Link, useNavigate } from 'react-router'
 import { useTranslation } from 'react-i18next'
 import { useConfirmDialog } from '../components/useConfirmDialog'
 import ViewToggle from '../components/ViewToggle'
@@ -13,7 +13,7 @@ import { api, BINDERY_BASE, Book, MediaType } from '../api/client'
 import BulkActionBar from '../components/BulkActionBar'
 import Pagination from '../components/Pagination'
 import { useServerPagination } from '../components/usePagination'
-import AddBookModal from '../components/AddBookModal'
+import AddToLibraryModal from '../components/AddToLibraryModal'
 
 type SortMode =
   | 'title-az' | 'title-za'
@@ -33,6 +33,7 @@ const statusLabelKeys: Record<string, string> = {
 
 export default function BooksPage() {
   const { t } = useTranslation()
+  const navigate = useNavigate()
   const { confirm, confirmDialog } = useConfirmDialog()
   const [books, setBooks] = useState<Book[]>([])
   const [total, setTotal] = useState(0)
@@ -211,7 +212,7 @@ export default function BooksPage() {
             onClick={() => setShowAddBook(true)}
             className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 rounded-md text-sm font-medium text-white transition-colors"
           >
-            {t('addBookModal.title')}
+            {t('addToLibrary.addBook')}
           </button>
         </div>
       </div>
@@ -508,11 +509,15 @@ export default function BooksPage() {
       />
 
       {showAddBook && (
-        <AddBookModal
+        <AddToLibraryModal
+          mode="book"
           onClose={() => setShowAddBook(false)}
-          onAdded={() => {
-            setShowAddBook(false)
-            load()
+          onAdded={added => {
+            // An author add has nothing on this list until its catalogue
+            // syncs, so land on the author instead of refreshing an unchanged
+            // page.
+            if (added.kind === 'author') navigate(`/author/${added.author.id}`)
+            else load()
           }}
         />
       )}

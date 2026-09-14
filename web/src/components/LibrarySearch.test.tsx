@@ -29,9 +29,13 @@ vi.mock('../api/client', () => ({
 
 // The real modal fans out to the metadata search; stub it so this test only
 // proves the handoff (the prop it receives), not the modal itself.
-vi.mock('./AddBookModal', () => ({
-  default: ({ initialQuery }: { initialQuery?: string }) => (
-    <div role="dialog" data-testid="add-book-modal">{initialQuery}</div>
+vi.mock('./AddToLibraryModal', () => ({
+  default: ({ initialQuery, onAdded }: { initialQuery?: string; onAdded: (added: unknown) => void }) => (
+    <div role="dialog" data-testid="add-to-library-modal">
+      {initialQuery}
+      <button type="button" onClick={() => onAdded({ kind: 'author', author: { id: 5 } })}>stub add author</button>
+      <button type="button" onClick={() => onAdded({ kind: 'book', book: { id: 8 } })}>stub add book</button>
+    </div>
   ),
 }))
 
@@ -172,7 +176,7 @@ describe('LibrarySearch', () => {
     fireEvent.keyDown(input, { key: 'Enter' })
     expect(screen.getByTestId('location')).toHaveTextContent('/')
     expect(screen.getByTestId('location')).not.toHaveTextContent('/book/11')
-    expect(screen.getByTestId('add-book-modal')).toHaveTextContent('zebra')
+    expect(screen.getByTestId('add-to-library-modal')).toHaveTextContent('zebra')
   })
 
   it('Escape closes the dropdown and does not clear the query', async () => {
@@ -191,15 +195,32 @@ describe('LibrarySearch', () => {
     expect(input).toHaveValue('')
   })
 
-  it('the add row opens the Add Book modal with the query', async () => {
+  it('the add row opens the Add to library modal with the query', async () => {
     vi.mocked(api.searchLibrary).mockResolvedValue({ authors: [], books: [], series: [] })
     renderSearch()
     await typeAndWait('The Dispossessed')
     fireEvent.click(screen.getByTestId('library-search-add'))
 
-    const modal = screen.getByTestId('add-book-modal')
+    const modal = screen.getByTestId('add-to-library-modal')
     expect(modal).toHaveTextContent('The Dispossessed')
     expect(screen.queryByRole('listbox')).not.toBeInTheDocument()
+  })
+
+  it('lands on the author page after an author add, and on the book page after a book add', async () => {
+    vi.mocked(api.searchLibrary).mockResolvedValue({ authors: [], books: [], series: [] })
+    const onNavigate = vi.fn()
+    renderSearch({ onNavigate })
+    await typeAndWait('le guin')
+    fireEvent.click(screen.getByTestId('library-search-add'))
+    fireEvent.click(screen.getByRole('button', { name: 'stub add author' }))
+    expect(screen.getByTestId('location')).toHaveTextContent('/author/5')
+    expect(screen.queryByTestId('add-to-library-modal')).not.toBeInTheDocument()
+    expect(onNavigate).toHaveBeenCalledTimes(1)
+
+    await typeAndWait('earthsea')
+    fireEvent.click(screen.getByTestId('library-search-add'))
+    fireEvent.click(screen.getByRole('button', { name: 'stub add book' }))
+    expect(screen.getByTestId('location')).toHaveTextContent('/book/8')
   })
 
   it('Enter with nothing highlighted takes the add row', async () => {
@@ -207,7 +228,7 @@ describe('LibrarySearch', () => {
     renderSearch()
     const input = await typeAndWait('earth')
     fireEvent.keyDown(input, { key: 'Enter' })
-    expect(screen.getByTestId('add-book-modal')).toHaveTextContent('earth')
+    expect(screen.getByTestId('add-to-library-modal')).toHaveTextContent('earth')
   })
 
   it('ignores a stale response that lands after a newer query', async () => {
