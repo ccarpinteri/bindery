@@ -63,6 +63,20 @@ function mediaLabel(mediaType?: Book['mediaType']): string {
   return '📖 Ebook'
 }
 
+// Previous/Next navigation (#2548), entirely client-side: AuthorsPage already
+// has its current page loaded and ordered, so it hands that over as router
+// `state` instead of this page re-fetching it. Not shared as an exported
+// type — AuthorsPage builds the same shape independently, same as the
+// seriesId router state between AuthorsPage and SeriesPage.
+//
+// Trade-off: only reaches as far as the loaded list page, and doesn't
+// survive a refresh or a direct link (router state is gone either way) —
+// Previous/Next just don't render then.
+interface AuthorNavState {
+  ids: number[]
+  index: number
+}
+
 export default function AuthorDetailPage() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
@@ -103,6 +117,11 @@ export default function AuthorDetailPage() {
     } catch { return false }
   })
   const [authorSeries, setAuthorSeries] = useState<Series[]>([])
+  // Tracks whose series `authorSeries` currently holds. The page stays
+  // mounted across Previous/Next (only authorId changes), so a plain
+  // "already loaded" check on authorSeries.length kept the previous
+  // author's series and grouped the new author's books against them.
+  const loadedSeriesAuthorId = useRef<number | null>(null)
 
   useEffect(() => {
     try { localStorage.setItem('bindery.group.author-detail.series', String(groupBySeries)) } catch { /* ignore */ }
@@ -112,13 +131,16 @@ export default function AuthorDetailPage() {
   // the default flat view never pays for the extra round trip. Failures fall
   // back to an empty set — every book then lands in the Standalone group.
   useEffect(() => {
-    if (!groupBySeries || authorSeries.length > 0) return
+    if (!groupBySeries || loadedSeriesAuthorId.current === authorId) return
+    // Drop the previous author's series before fetching, so neither the
+    // in flight window nor a failed fetch groups these books against them.
+    setAuthorSeries([])
     let cancelled = false
     api.listAuthorSeries(authorId)
-      .then(s => { if (!cancelled) setAuthorSeries(s) })
+      .then(s => { if (!cancelled) { setAuthorSeries(s); loadedSeriesAuthorId.current = authorId } })
       .catch(() => { /* leave empty: books fall into Standalone */ })
     return () => { cancelled = true }
-  }, [groupBySeries, authorId, authorSeries.length])
+  }, [groupBySeries, authorId])
 
   // Filter / sort state — persisted to localStorage under page-scoped keys
   const [typeFilter, setTypeFilter] = useState<MediaFilter>(() => {
@@ -183,6 +205,9 @@ export default function AuthorDetailPage() {
   useEffect(() => {
     let cancelled = false
     setLoading(true)
+    // The page stays mounted across Previous/Next, so a stale error from the
+    // previous author would otherwise still be showing under the new one.
+    setError(null)
     // listAllBooks pages through the server until the author's complete
     // catalogue is loaded — a plain listBooks call silently capped the list at
     // the server default of 100, corrupting counts/filters/select-all (#1467).
@@ -195,6 +220,19 @@ export default function AuthorDetailPage() {
       .finally(() => { if (!cancelled) setLoading(false) })
     return () => { cancelled = true }
   }, [authorId, showExcluded])
+
+  // Validated against authorId: stale state (browser back/forward) or no
+  // state at all (opened from elsewhere) must read as "no nav info", not
+  // point at the wrong neighbour.
+  const navState = (() => {
+    const s = location.state as AuthorNavState | null
+    if (s && Array.isArray(s.ids) && typeof s.index === 'number' && s.ids[s.index] === authorId) {
+      return s
+    }
+    return null
+  })()
+  const prevId = navState && navState.index > 0 ? navState.ids[navState.index - 1] : null
+  const nextId = navState && navState.index < navState.ids.length - 1 ? navState.ids[navState.index + 1] : null
 
   useEffect(() => {
     const params = new URLSearchParams(location.search)
@@ -680,8 +718,38 @@ export default function AuthorDetailPage() {
     // One width shared with BookDetailPage — see the note there.
     <div className={`max-w-7xl ${selected.size > 0 ? 'pb-20' : ''}`}>
       {confirmDialog}
-      <div className="mb-4 flex items-center gap-3 text-sm">
-        <button onClick={() => navigate(-1)} className="text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-white">← Back</button>
+      <div className="mb-4 flex items-center justify-between gap-3 text-sm">
+        {/* Only inside a Previous/Next chain does Back go to the Authors
+            list rather than browser history: a few hops through Next/Previous
+            land one page short of where the list actually was. Arriving any
+            other way (Wanted, the Books list, a book page, a direct link)
+            must fall back to navigate(-1) or Back would strand those flows
+            on the Authors list instead of where they came from. */}
+        {navState ? (
+          <Link to="/" className="text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-white">← Back</Link>
+        ) : (
+          <button
+            type="button"
+            onClick={() => navigate(-1)}
+            className="text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-white"
+          >
+            ← Back
+          </button>
+        )}
+        {navState && (prevId !== null || nextId !== null) && (
+          <div className="flex items-center gap-2">
+            {prevId !== null && (
+              <Link to={`/author/${prevId}`} state={{ ids: navState.ids, index: navState.index - 1 }} aria-label={t('authorDetail.nav.previousAriaLabel', 'Previous author')} className={`${btn.ghost} ${btnSize.sm}`}>
+                {t('authorDetail.nav.previous', '‹ Previous')}
+              </Link>
+            )}
+            {nextId !== null && (
+              <Link to={`/author/${nextId}`} state={{ ids: navState.ids, index: navState.index + 1 }} aria-label={t('authorDetail.nav.nextAriaLabel', 'Next author')} className={`${btn.ghost} ${btnSize.sm}`}>
+                {t('authorDetail.nav.next', 'Next ›')}
+              </Link>
+            )}
+          </div>
+        )}
       </div>
 
       <div className="flex flex-col sm:flex-row gap-6 mb-8">

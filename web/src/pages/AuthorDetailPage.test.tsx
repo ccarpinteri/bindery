@@ -94,13 +94,25 @@ function LocationProbe({ onLocation }: { onLocation?: (location: string) => void
   return null
 }
 
-function renderAuthorDetailPage(books: Book[], view: 'grid' | 'table' = 'grid', authorOverride: Partial<Author> = {}, initialPath = '/author/42', onLocation?: (location: string) => void) {
+type NavEntry = string | { pathname: string; state?: unknown }
+
+function renderAuthorDetailPage(
+  books: Book[],
+  view: 'grid' | 'table' = 'grid',
+  authorOverride: Partial<Author> = {},
+  initialPath: NavEntry | NavEntry[] = '/author/42',
+  onLocation?: (location: string) => void,
+) {
   localStorage.setItem('bindery.view.author-detail', view)
   vi.mocked(api.getAuthor).mockResolvedValue({ ...author, ...authorOverride })
   vi.mocked(api.listAllBooks).mockResolvedValue(books)
 
+  // A multi-entry array simulates real browser history (e.g. arriving from
+  // the Books list) so Back's navigate(-1) fallback has somewhere to land.
+  const initialEntries = Array.isArray(initialPath) ? initialPath : [initialPath]
+
   return render(
-    <MemoryRouter initialEntries={[initialPath]}>
+    <MemoryRouter initialEntries={initialEntries} initialIndex={initialEntries.length - 1}>
       <LocationProbe onLocation={onLocation} />
       <Routes>
         <Route path="/author/:id" element={<AuthorDetailPage />} />
@@ -944,5 +956,146 @@ describe('AuthorDetailPage — last sync outcome', () => {
     renderAuthorDetailPage([makeBook({ id: 1, title: 'Only Book', status: 'imported' })])
     await screen.findByRole('heading', { name: 'Only Book' })
     expect(screen.queryByTestId('author-sync-notice')).toBeNull()
+  })
+})
+
+describe('AuthorDetailPage — Previous/Next navigation (#2548, frontend-only)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    installLocalStorageMock()
+    vi.mocked(api.listAuthorSeries).mockResolvedValue([])
+  })
+
+  it('hides the controls when there is no router state at all (opened from a Series tab, a bookmark, or after a refresh)', async () => {
+    renderAuthorDetailPage([])
+    await screen.findByText('Brandon Sanderson')
+    expect(screen.queryByLabelText('Previous author')).toBeNull()
+    expect(screen.queryByLabelText('Next author')).toBeNull()
+  })
+
+  it('renders Previous/Next from router state and follows Next to the right id, carrying the chain state', async () => {
+    let lastLocation = ''
+    renderAuthorDetailPage(
+      [], 'grid', {},
+      { pathname: '/author/42', state: { ids: [40, 42, 43, 44, 45], index: 1 } },
+      loc => { lastLocation = loc },
+    )
+    await screen.findByText('Brandon Sanderson')
+
+    fireEvent.click(screen.getByLabelText('Next author'))
+
+    await waitFor(() => expect(lastLocation).toBe('/author/43'))
+  })
+
+  it('hides Previous at the first position and shows only Next', async () => {
+    renderAuthorDetailPage([], 'grid', {}, { pathname: '/author/42', state: { ids: [42, 43], index: 0 } })
+    await screen.findByText('Brandon Sanderson')
+
+    expect(screen.queryByLabelText('Previous author')).toBeNull()
+    expect(screen.getByLabelText('Next author')).toBeInTheDocument()
+  })
+
+  it('hides the controls for a single-author list (both ends null)', async () => {
+    renderAuthorDetailPage([], 'grid', {}, { pathname: '/author/42', state: { ids: [42], index: 0 } })
+    await screen.findByText('Brandon Sanderson')
+    expect(screen.queryByLabelText('Previous author')).toBeNull()
+    expect(screen.queryByLabelText('Next author')).toBeNull()
+  })
+
+  it('ignores state that does not match this author (stale browser back/forward state)', async () => {
+    // ids[index] is 99, not 42 — a mismatch that must be treated as no
+    // navigation info rather than pointing at the wrong neighbour.
+    renderAuthorDetailPage([], 'grid', {}, { pathname: '/author/42', state: { ids: [98, 99, 100], index: 1 } })
+    await screen.findByText('Brandon Sanderson')
+    expect(screen.queryByLabelText('Previous author')).toBeNull()
+    expect(screen.queryByLabelText('Next author')).toBeNull()
+  })
+
+  it('returns to the Authors list on Back when arrived via a Previous/Next chain', async () => {
+    let lastLocation = ''
+    renderAuthorDetailPage(
+      [], 'grid', {}, { pathname: '/author/42', state: { ids: [40, 42, 43], index: 1 } },
+      loc => { lastLocation = loc },
+    )
+    await screen.findByText('Brandon Sanderson')
+
+    fireEvent.click(screen.getByText('← Back'))
+
+    await waitFor(() => expect(lastLocation).toBe('/'))
+  })
+
+  it('falls back to browser history on Back when there is no nav state, so Wanted/Books/a book page are not stranded on the Authors list', async () => {
+    let lastLocation = ''
+    renderAuthorDetailPage([], 'grid', {}, ['/books/9', '/author/42'], loc => { lastLocation = loc })
+    await screen.findByText('Brandon Sanderson')
+
+    fireEvent.click(screen.getByText('← Back'))
+
+    await waitFor(() => expect(lastLocation).toBe('/books/9'))
+  })
+
+  it("refetches the new author's series after Next instead of reusing the previous author's (state leak)", async () => {
+    localStorage.setItem('bindery.view.author-detail', 'table')
+    vi.mocked(api.getAuthor).mockImplementation((id: number) =>
+      Promise.resolve({ ...author, id, authorName: id === 42 ? 'Brandon Sanderson' : 'Patrick Rothfuss' }))
+    vi.mocked(api.listAllBooks).mockImplementation(({ authorId }: { authorId?: number } = {}) =>
+      Promise.resolve(authorId === 42
+        ? [makeBook({ id: 10, title: 'The Final Empire', status: 'imported' })]
+        : [makeBook({ id: 20, title: 'The Name of the Wind', status: 'imported' })]))
+    vi.mocked(api.listAuthorSeries).mockImplementation((authorId: number) =>
+      Promise.resolve(authorId === 42
+        ? [{
+            id: 1, foreignSeriesId: 'OL-MB', title: 'Mistborn', description: '', monitored: true,
+            books: [{ seriesId: 1, bookId: 10, positionInSeries: '1' }],
+          }]
+        : [{
+            id: 2, foreignSeriesId: 'OL-KING', title: 'Kingkiller Chronicle', description: '', monitored: true,
+            books: [{ seriesId: 2, bookId: 20, positionInSeries: '1' }],
+          }]))
+
+    render(
+      <MemoryRouter initialEntries={[{ pathname: '/author/42', state: { ids: [42, 43], index: 0 } }]}>
+        <Routes>
+          <Route path="/author/:id" element={<AuthorDetailPage />} />
+        </Routes>
+      </MemoryRouter>,
+    )
+
+    await screen.findByText('Brandon Sanderson')
+    fireEvent.click(screen.getByRole('switch', { name: 'Group by series' }))
+    expect(await screen.findByRole('heading', { name: /Mistborn/ })).toBeInTheDocument()
+
+    fireEvent.click(screen.getByLabelText('Next author'))
+    await screen.findByText('Patrick Rothfuss')
+
+    // Without the fix, authorSeries.length > 0 (still 42's Mistborn) skips the
+    // refetch, and book id 20 doesn't match series 1's bookId 10 — so this
+    // would render Standalone only, with the Kingkiller heading missing.
+    expect(await screen.findByRole('heading', { name: /Kingkiller Chronicle/ })).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: /Mistborn/ })).not.toBeInTheDocument()
+  })
+
+  it('clears a stale error from the previous author after Next', async () => {
+    vi.mocked(api.getAuthor).mockImplementation((id: number) =>
+      Promise.resolve({ ...author, id, authorName: id === 42 ? 'Brandon Sanderson' : 'Patrick Rothfuss' }))
+    vi.mocked(api.listAllBooks).mockResolvedValue([])
+    vi.mocked(api.updateAuthor).mockRejectedValue(new Error('Update failed'))
+
+    render(
+      <MemoryRouter initialEntries={[{ pathname: '/author/42', state: { ids: [42, 43], index: 0 } }]}>
+        <Routes>
+          <Route path="/author/:id" element={<AuthorDetailPage />} />
+        </Routes>
+      </MemoryRouter>,
+    )
+
+    await screen.findByText('Brandon Sanderson')
+    fireEvent.click(screen.getByRole('switch', { name: 'Stop monitoring' }))
+    expect(await screen.findByText('Update failed')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByLabelText('Next author'))
+    await screen.findByText('Patrick Rothfuss')
+
+    expect(screen.queryByText('Update failed')).not.toBeInTheDocument()
   })
 })
