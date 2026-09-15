@@ -26,7 +26,7 @@ type Aggregator struct {
 	primary   Provider
 	enrichers []Provider
 	audnex    AudnexBookClient
-	audible   *audible.Client
+	audible   audibleCatalogue
 	cache     *ttlCache
 }
 
@@ -51,6 +51,13 @@ func NewAggregator(primary Provider, enrichers ...Provider) *Aggregator {
 // ASIN canonicalization deterministic without reaching the network.
 func (a *Aggregator) WithAudnexClient(client AudnexBookClient) *Aggregator {
 	a.audnex = client
+	return a
+}
+
+// WithAudibleCatalogue replaces the Audible client GetAuthorAudiobooks asks.
+// Tests outside this package use it to stand in for api.audible.com.
+func (a *Aggregator) WithAudibleCatalogue(catalogue audibleCatalogue) *Aggregator {
+	a.audible = catalogue
 	return a
 }
 
@@ -757,10 +764,18 @@ func searchFormatKey(mediaType string) string {
 	}
 }
 
+// GetAuthor returns an author profile from the provider that owns foreignID,
+// cached for 24 hours. A WithCacheBypass context skips the cached copy and
+// replaces it with the provider's answer (#2601).
 func (a *Aggregator) GetAuthor(ctx context.Context, foreignID string) (*models.Author, error) {
 	key := "author:" + foreignID
-	if cached, ok := a.cache.get(key); ok {
-		return cached.(*models.Author), nil
+	// Read, not consumed: the provider call below is the only lookup this
+	// makes, and leaving the flag on ctx lets tests and logs see it there.
+	fresh := CacheBypassed(ctx)
+	if !fresh {
+		if cached, ok := a.cache.get(key); ok {
+			return cached.(*models.Author), nil
+		}
 	}
 
 	provider := a.providerForForeignID(foreignID)

@@ -23,6 +23,7 @@ import (
 	"github.com/vavallee/bindery/internal/auth"
 	"github.com/vavallee/bindery/internal/db"
 	"github.com/vavallee/bindery/internal/importer"
+	"github.com/vavallee/bindery/internal/jobs"
 	"github.com/vavallee/bindery/internal/metadata"
 	"github.com/vavallee/bindery/internal/models"
 )
@@ -114,6 +115,14 @@ type stubMetaProvider struct {
 	// author, when non-nil, is returned by GetAuthor so tests can exercise
 	// the author-profile refresh path (Discussion #1226).
 	author *models.Author
+	// getAuthorBypass, when non-nil, receives whether each GetAuthor call
+	// carried metadata.WithCacheBypass, so a test can tell a refresh that
+	// reached the provider from one the aggregator cache answered (#2601).
+	// Buffered by the test; a full channel drops the report, never blocks.
+	getAuthorBypass chan bool
+	// getAuthorGate, when non-nil, blocks every GetAuthor call until it is
+	// closed, after the getAuthorBypass signal. Holds a catalogue sync open.
+	getAuthorGate chan struct{}
 }
 
 func (p *stubMetaProvider) Name() string {
@@ -128,7 +137,16 @@ func (p *stubMetaProvider) SearchAuthors(_ context.Context, _ string) ([]models.
 func (p *stubMetaProvider) SearchBooks(_ context.Context, _ string) ([]models.Book, error) {
 	return nil, nil
 }
-func (p *stubMetaProvider) GetAuthor(_ context.Context, _ string) (*models.Author, error) {
+func (p *stubMetaProvider) GetAuthor(ctx context.Context, _ string) (*models.Author, error) {
+	if p.getAuthorBypass != nil {
+		select {
+		case p.getAuthorBypass <- metadata.CacheBypassed(ctx):
+		default:
+		}
+	}
+	if p.getAuthorGate != nil {
+		<-p.getAuthorGate
+	}
 	return p.author, nil
 }
 func (p *stubMetaProvider) GetBook(_ context.Context, fid string) (*models.Book, error) {
@@ -8306,5 +8324,236 @@ func TestAddBook_AdminGetsConflictForOtherUsersBook(t *testing.T) {
 	}
 	if after.Monitored {
 		t.Fatalf("admin re-add flipped alice's book to monitored")
+	}
+}
+
+// TestAuthorRefresh_ManualRefreshBypassesMetadataCache pins #2601. The metadata
+// aggregator caches author profiles and catalogues for 24 hours, and the manual
+// Refresh Metadata action used to read through that cache, so a bio, photo or
+// new book that appeared upstream stayed invisible for up to a day after the
+// user explicitly asked for it. The bulk paths (selection refresh and Refresh
+// all, both RefreshAuthorBooks) deliberately keep the cache: they fan out over
+// many authors, and the cache is what stops a repeat run refetching them all.
+func TestAuthorRefresh_ManualRefreshBypassesMetadataCache(t *testing.T) {
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	authorRepo := db.NewAuthorRepo(database)
+	bookRepo := db.NewBookRepo(database)
+	profileRepo := db.NewMetadataProfileRepo(database)
+	ctx := context.Background()
+
+	author := &models.Author{
+		ForeignID: "OL2601A", Name: "Ann Leckie", SortName: "Leckie, Ann",
+		MetadataProvider: "openlibrary", Monitored: true,
+	}
+	if err := authorRepo.Create(ctx, author); err != nil {
+		t.Fatal(err)
+	}
+	work := func(id, title string) models.Book {
+		return models.Book{ForeignID: id, Title: title, SortTitle: strings.ToLower(title), Language: "eng",
+			Status: models.BookStatusWanted, Genres: []string{}, MetadataProvider: "openlibrary"}
+	}
+	stub := &stubMetaProvider{
+		works:  []models.Book{work("OL2601W1", "Ancillary Justice")},
+		author: &models.Author{ForeignID: "OL2601A", Name: "Ann Leckie", Description: "old bio", MetadataProvider: "openlibrary"},
+	}
+	agg := metadata.NewAggregator(stub)
+	group := jobs.NewGroup(context.Background())
+	defer group.Shutdown(5 * time.Second) // runs before database.Close
+	h := NewAuthorHandler(authorRepo, nil, bookRepo, nil, agg, nil, profileRepo, nil).WithJobs(group)
+
+	profileAndBooks := func() (string, int) {
+		t.Helper()
+		got, err := authorRepo.GetByID(ctx, author.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		books, err := bookRepo.ListByAuthor(ctx, author.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got.Description, len(books)
+	}
+
+	// Warm the aggregator cache the way a bulk refresh does.
+	h.RefreshAuthorBooks(author, false, "")
+	if desc, n := profileAndBooks(); desc != "old bio" || n != 1 {
+		t.Fatalf("after warm refresh: description %q, %d books; want %q and 1", desc, n, "old bio")
+	}
+
+	// Upstream changes: a new bio and a new book.
+	stub.author = &models.Author{ForeignID: "OL2601A", Name: "Ann Leckie", Description: "new bio", MetadataProvider: "openlibrary"}
+	stub.works = []models.Book{work("OL2601W1", "Ancillary Justice"), work("OL2601W2", "Translation State")}
+	stub.getAuthorBypass = make(chan bool, 8)
+
+	// The bulk path keeps reading through the cache.
+	reloaded, err := authorRepo.GetByID(ctx, author.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.RefreshAuthorBooks(reloaded, false, "")
+	if n := len(stub.getAuthorBypass); n != 0 {
+		t.Fatalf("bulk refresh reached the provider %d times; it should be answered by the cache", n)
+	}
+	if desc, n := profileAndBooks(); desc != "old bio" || n != 1 {
+		t.Fatalf("after bulk refresh: description %q, %d books; want the cached %q and 1", desc, n, "old bio")
+	}
+
+	// The manual Refresh Metadata action must go to the provider.
+	id := strconv.FormatInt(author.ID, 10)
+	req := withURLParam(httptest.NewRequest(http.MethodPost, "/api/v1/author/"+id+"/refresh", nil), "id", id)
+	rec := httptest.NewRecorder()
+	h.Refresh(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("Refresh status = %d, want 202: %s", rec.Code, rec.Body.String())
+	}
+	select {
+	case bypassed := <-stub.getAuthorBypass:
+		if !bypassed {
+			t.Fatal("manual refresh reached the provider without metadata.WithCacheBypass")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("manual refresh never reached the provider: the 24 hour metadata cache answered it (#2601)")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		desc, n := profileAndBooks()
+		if desc == "new bio" && n == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("after manual refresh: description %q, %d books; want %q and 2", desc, n, "new bio")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// The fresh profile was written back: an ordinary read serves it from the
+	// cache without another provider call.
+	cached, err := agg.GetAuthor(ctx, author.ForeignID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cached == nil || cached.Description != "new bio" {
+		t.Fatalf("ordinary GetAuthor after refresh = %+v, want the refreshed %q from the cache", cached, "new bio")
+	}
+	if n := len(stub.getAuthorBypass); n != 0 {
+		t.Fatalf("ordinary GetAuthor after refresh reached the provider (%d extra calls)", n)
+	}
+}
+
+// TestAuthorRefresh_RefusesSecondRefreshWhileSyncRuns: five clicks on Refresh
+// used to start five concurrent full syncs, each one bypassing the metadata
+// cache (#2601 review). A click while a sync for that author is running is
+// refused with 409, the author payload says a sync is running so the page can
+// wait for it, and a click after it finishes starts a new one.
+func TestAuthorRefresh_RefusesSecondRefreshWhileSyncRuns(t *testing.T) {
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	authorRepo := db.NewAuthorRepo(database)
+	bookRepo := db.NewBookRepo(database)
+	profileRepo := db.NewMetadataProfileRepo(database)
+	ctx := context.Background()
+
+	author := &models.Author{
+		ForeignID: "OL2601A", Name: "Ann Leckie", SortName: "Leckie, Ann",
+		MetadataProvider: "openlibrary", Monitored: true,
+	}
+	if err := authorRepo.Create(ctx, author); err != nil {
+		t.Fatal(err)
+	}
+	gate := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(gate) }) }
+	stub := &stubMetaProvider{
+		works: []models.Book{{ForeignID: "OL2601W1", Title: "Ancillary Justice", SortTitle: "ancillary justice", Language: "eng",
+			Status: models.BookStatusWanted, Genres: []string{}, MetadataProvider: "openlibrary"}},
+		author:          &models.Author{ForeignID: "OL2601A", Name: "Ann Leckie", Description: "bio", MetadataProvider: "openlibrary"},
+		getAuthorBypass: make(chan bool, 8),
+		getAuthorGate:   gate,
+	}
+	group := jobs.NewGroup(context.Background())
+	defer group.Shutdown(5 * time.Second) // runs before database.Close
+	defer release()                       // runs before Shutdown, so a held sync can drain
+	h := NewAuthorHandler(authorRepo, nil, bookRepo, nil, metadata.NewAggregator(stub), nil, profileRepo, nil).WithJobs(group)
+
+	id := strconv.FormatInt(author.ID, 10)
+	click := func() *httptest.ResponseRecorder {
+		t.Helper()
+		req := withURLParam(httptest.NewRequest(http.MethodPost, "/api/v1/author/"+id+"/refresh", nil), "id", id)
+		rec := httptest.NewRecorder()
+		h.Refresh(rec, req)
+		return rec
+	}
+	syncing := func() bool {
+		t.Helper()
+		req := withURLParam(httptest.NewRequest(http.MethodGet, "/api/v1/author/"+id, nil), "id", id)
+		rec := httptest.NewRecorder()
+		h.Get(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET author = %d: %s", rec.Code, rec.Body.String())
+		}
+		var got models.Author
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatalf("decode author: %v", err)
+		}
+		return got.SyncInProgress
+	}
+	waitForProvider := func() {
+		t.Helper()
+		select {
+		case <-stub.getAuthorBypass:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the refresh sync never reached the provider")
+		}
+	}
+
+	if rec := click(); rec.Code != http.StatusAccepted {
+		t.Fatalf("first Refresh = %d, want 202: %s", rec.Code, rec.Body.String())
+	}
+	waitForProvider() // the first sync is now held inside GetAuthor
+
+	rec := click()
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("second Refresh while the first sync runs = %d, want 409: a second concurrent sync was started", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "already running") {
+		t.Fatalf("409 body = %s, want a message saying a refresh is already running", rec.Body.String())
+	}
+	select {
+	case <-stub.getAuthorBypass:
+		t.Fatal("the refused Refresh still reached the provider")
+	default:
+	}
+	if !syncing() {
+		t.Fatal("author payload does not report the running sync; the page cannot tell when it finishes")
+	}
+
+	release()
+	deadline := time.Now().Add(5 * time.Second)
+	for syncing() {
+		if time.Now().After(deadline) {
+			t.Fatal("author payload still reports a running sync after it finished")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if rec := click(); rec.Code != http.StatusAccepted {
+		t.Fatalf("Refresh after the first sync finished = %d, want 202: %s", rec.Code, rec.Body.String())
+	}
+	waitForProvider()
+	deadline = time.Now().Add(5 * time.Second)
+	for syncing() {
+		if time.Now().After(deadline) {
+			t.Fatal("the third sync never finished")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

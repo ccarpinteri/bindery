@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useLocation, useNavigate, useParams } from 'react-router'
 import { useTranslation } from 'react-i18next'
 import { useConfirmDialog } from '../components/useConfirmDialog'
-import { api, Author, AuthorAlias, Book, BookBulkAction, MediaType, Series } from '../api/client'
+import { api, ApiError, Author, AuthorAlias, Book, BookBulkAction, MediaType, Series } from '../api/client'
 import ViewToggle from '../components/ViewToggle'
 import { bookStatusBadge } from '../components/bookStatus'
 import MergeAuthorsModal from '../components/MergeAuthorsModal'
@@ -77,6 +77,13 @@ interface AuthorNavState {
   index: number
 }
 
+// A manual Refresh answers 202 and runs the catalogue sync in the background.
+// The page polls the author until the server says the sync has finished, then
+// shows the result, instead of re-reading straight away and showing the page
+// as it was before the click (#2601).
+const REFRESH_POLL_INTERVAL_MS = 2000
+const REFRESH_POLL_TIMEOUT_MS = 60000
+
 export default function AuthorDetailPage() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
@@ -89,7 +96,26 @@ export default function AuthorDetailPage() {
   const [books, setBooks] = useState<Book[]>([])
   const [allAuthors, setAllAuthors] = useState<Author[]>([])
   const [loading, setLoading] = useState(true)
-  const [refreshing, setRefreshing] = useState(false)
+  // Bumping reloadKey reruns the load effect with the filters in force at
+  // that moment. A manual Refresh reloads this way once its sync ends, so a
+  // filter picked while it waited is honoured (#2601). quietReload keeps the
+  // page on screen for that reload instead of flashing the loading state.
+  const [reloadKey, setReloadKey] = useState(0)
+  const quietReload = useRef(false)
+  // Which author a manual Refresh is running for, so moving to another author
+  // with Previous/Next does not carry the spinner along (#2601).
+  const [refreshingAuthorId, setRefreshingAuthorId] = useState<number | null>(null)
+  const refreshing = refreshingAuthorId === authorId
+  // One session per author shown. A refresh poll stops writing once the page
+  // has moved to another author or unmounted.
+  const pageSession = useRef({ active: true })
+  useEffect(() => {
+    const session = { active: true }
+    pageSession.current = session
+    return () => {
+      session.active = false
+    }
+  }, [authorId])
   const [searchingWanted, setSearchingWanted] = useState(false)
   const [showMerge, setShowMerge] = useState(false)
   const [showEdit, setShowEdit] = useState(false)
@@ -204,7 +230,9 @@ export default function AuthorDetailPage() {
 
   useEffect(() => {
     let cancelled = false
-    setLoading(true)
+    const quiet = quietReload.current
+    quietReload.current = false
+    if (!quiet) setLoading(true)
     // The page stays mounted across Previous/Next, so a stale error from the
     // previous author would otherwise still be showing under the new one.
     setError(null)
@@ -219,7 +247,7 @@ export default function AuthorDetailPage() {
       .catch(err => setError(err instanceof Error ? err.message : 'Failed to load'))
       .finally(() => { if (!cancelled) setLoading(false) })
     return () => { cancelled = true }
-  }, [authorId, showExcluded])
+  }, [authorId, showExcluded, reloadKey])
 
   // Validated against authorId: stale state (browser back/forward) or no
   // state at all (opened from elsewhere) must read as "no nav info", not
@@ -254,16 +282,55 @@ export default function AuthorDetailPage() {
 
   const handleRefresh = async () => {
     if (!author) return
-    setRefreshing(true)
+    const session = pageSession.current
+    const refreshedId = author.id
+    setRefreshingAuthorId(refreshedId)
+    // Reports whether this click started a sync. 409 means a sync for the
+    // author is already running.
+    const startRefresh = async () => {
+      try {
+        await api.refreshAuthor(refreshedId)
+        return true
+      } catch (e) {
+        if (e instanceof ApiError && e.status === 409) return false
+        throw e
+      }
+    }
+    // Polls until the author's sync ends: 'done', 'timeout' after a minute,
+    // or 'gone' once the page has moved to another author.
+    const waitForSync = async (): Promise<'done' | 'timeout' | 'gone'> => {
+      const deadline = Date.now() + REFRESH_POLL_TIMEOUT_MS
+      while (Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, REFRESH_POLL_INTERVAL_MS))
+        if (!session.active) return 'gone'
+        const latest = await api.getAuthor(refreshedId)
+        if (!session.active) return 'gone'
+        if (!latest.syncInProgress) return 'done'
+      }
+      return 'timeout'
+    }
     try {
-      await api.refreshAuthor(author.id)
-      const [a, bs] = await Promise.all([api.getAuthor(authorId), api.listAllBooks({ authorId, includeExcluded: showExcluded })])
-      setAuthor(a)
-      setBooks(bs)
+      const started = await startRefresh()
+      let waited = await waitForSync()
+      if (waited === 'gone') return
+      // A 409 means the running sync was not this click's: a scheduled, bulk,
+      // Refresh all or add sync, and none of those read past the metadata
+      // cache. Once it ends, ask once more so the page shows current data. A
+      // second 409 means yet another sync started meanwhile; show what is
+      // there rather than chase it.
+      if (!started && waited === 'done' && await startRefresh()) {
+        waited = await waitForSync()
+        if (waited === 'gone') return
+      }
+      if (!session.active) return
+      // Reload through the load effect, which reads the filters in force now
+      // rather than the ones this click saw.
+      quietReload.current = true
+      setReloadKey(k => k + 1)
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Refresh failed')
+      if (session.active) setError(e instanceof Error ? e.message : 'Refresh failed')
     } finally {
-      setRefreshing(false)
+      setRefreshingAuthorId(current => (current === refreshedId ? null : current))
     }
   }
 
