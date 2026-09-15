@@ -1134,9 +1134,10 @@ func main() {
 		// Storage paths, admin-only (see registerStorageRoutes).
 		registerStorageRoutes(r, api.NewStorageHandler(cfg))
 
-		// Library
+		// Library. The scan status returns server filesystem paths, so it is
+		// admin only (#2361); see registerLibraryScanStatusRoute.
 		r.Post("/library/scan", libraryHandler.Scan)
-		r.Get("/library/scan/status", libraryHandler.ScanStatus)
+		registerLibraryScanStatusRoute(r, libraryHandler)
 
 		// Refresh metadata for ALL authors (background job, #863). Per-selection
 		// bulk refresh lives at /author/bulk; this is the "populate everything"

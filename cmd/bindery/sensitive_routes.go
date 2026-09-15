@@ -1,12 +1,10 @@
 package main
 
 import (
-	"net/http"
-
 	"github.com/go-chi/chi/v5"
-
 	"github.com/vavallee/bindery/internal/api"
 	"github.com/vavallee/bindery/internal/auth"
+	"net/http"
 )
 
 // systemLogRouteHandler is the surface registerSystemLogRoutes needs.
@@ -200,5 +198,28 @@ func registerStorageRoutes(r chi.Router, h storageRouteHandler) {
 	r.Group(func(r chi.Router) {
 		r.Use(auth.RequireAdmin)
 		r.Get("/system/storage", h.Get)
+	})
+}
+
+// libraryScanStatusRouteHandler is the surface registerLibraryScanStatusRoute
+// needs.
+type libraryScanStatusRouteHandler interface {
+	ScanStatus(http.ResponseWriter, *http.Request)
+}
+
+// registerLibraryScanStatusRoute mounts GET /library/scan/status admin only
+// (#2361). The response is the library.lastScan blob verbatim, which carries
+// library_dir, audiobook_dir, scanned_paths and the absolute path of every
+// unmatched file: the server filesystem layout /system/storage is gated for,
+// and the key isAdminOnlySetting already withholds from GET /setting. Leaving
+// this route open kept a second door to the same value.
+//
+// Gated rather than redacted because the only caller is the scan panel in
+// Settings > General, which renders inside that tab's isAdmin block, so no non
+// admin screen loses anything and no third response shape enters the API.
+func registerLibraryScanStatusRoute(r chi.Router, h libraryScanStatusRouteHandler) {
+	r.Group(func(r chi.Router) {
+		r.Use(auth.RequireAdmin)
+		r.Get("/library/scan/status", h.ScanStatus)
 	})
 }
