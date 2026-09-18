@@ -381,8 +381,12 @@ func Middleware(p Provider) func(http.Handler) http.Handler {
 			// credential revocation). When set, an otherwise-unauthenticated
 			// request is answered with 500 instead of 401 below.
 			epochLookupFailed := false
+			// sessionUID is the user a correctly signed, unexpired cookie
+			// names, whether or not the epoch check could run.
+			var sessionUID int64
 			if c, err := r.Cookie(SessionCookieName); err == nil {
 				if uid, epoch, err := VerifySessionMultiWithEpoch(p.SessionSecrets(), c.Value); err == nil {
+					sessionUID = uid
 					// Compare the cookie's epoch field against the user's
 					// current session_epoch (bumped on password change). A
 					// mismatch means the cookie pre-dates the most recent
@@ -457,7 +461,28 @@ func Middleware(p Provider) func(http.Handler) http.Handler {
 				next.ServeHTTP(w, r)
 				return
 			}
+			// A requester's own session is never elevated by the auth mode.
+			// Without this, local-only served a requester on the LAN (and
+			// disabled mode served every requester) as the admin, API key
+			// included. Only the requester role is excluded here; what the mode
+			// grant does for admin and user sessions is unchanged.
+			if (cookieValid || proxyValid) && UserRoleFromContext(r.Context()) == RoleRequester {
+				next.ServeHTTP(w, r)
+				return
+			}
 			if ModeGrantsAdmin(mode, r, p.TrustedProxyCIDRs()) {
+				// A signed session whose epoch or role could not be read (a
+				// database error) might belong to a requester, so the mode
+				// grant is not applied to it. It goes through as that user
+				// with no role, which RestrictRequester holds to the allow list
+				// and RequireAdmin refuses: fail closed until the database
+				// answers again.
+				if epochLookupFailed || (cookieValid && UserRoleFromContext(r.Context()) == "") {
+					ctx := context.WithValue(r.Context(), userIDCtxKey, sessionUID)
+					ctx = context.WithValue(ctx, userRoleCtxKey, "")
+					next.ServeHTTP(w, r.WithContext(ctx))
+					return
+				}
 				// The mode itself admits the caller (disabled: everyone;
 				// local-only: a trusted local client), so the request acts as
 				// the install's admin, mirroring the API-key branch above. It is
