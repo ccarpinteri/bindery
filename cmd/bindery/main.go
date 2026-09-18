@@ -636,7 +636,8 @@ func main() {
 		WithEditionHydration(editionRepo).
 		WithRoots(libraryRoots).
 		WithLifetimeCtx(appCtx).
-		WithJobs(bgJobs) // drain an in-flight author catalogue sync on shutdown (#2371)
+		WithNotifier(notif). // bookAnnounced when a refresh or discovery adds books (#2236)
+		WithJobs(bgJobs)     // drain an in-flight author catalogue sync on shutdown (#2371)
 	authorAliasHandler := api.NewAuthorAliasHandler(authorRepo, authorAliasRepo)
 	bookHandler := api.NewBookHandler(bookRepo, metaAgg, historyRepo, sched).
 		WithSettings(settingsRepo).
@@ -734,6 +735,11 @@ func main() {
 	authorRefreshHandler := api.NewAuthorRefreshHandler(authorRepo, func(a *models.Author) {
 		authorHandler.RefreshAuthorBooks(a, false, authorHandler.ResolveDefaultMediaType(appCtx))
 	}).WithSettings(settingsRepo)
+	// Scheduled release discovery (#2236): an hourly tick checks a share of the
+	// monitored authors, stopped while Refresh all or refresh selected runs.
+	sched.WithAuthorDiscoverer(newAuthorDiscoverer(authorHandler.DiscoverAuthorBooks, func() bool {
+		return authorRefreshHandler.Running() || bulkHandler.RefreshRunning()
+	}))
 	backupHandler := api.NewBackupHandler(database, cfg.DBPath, cfg.DataDir)
 	rootFolderHandler := api.NewRootFolderHandler(rootFolderRepo)
 	logHandler := api.NewLogHandler(ring).WithLogRepo(logRepo).WithDBLogHandler(logDBHandler)
