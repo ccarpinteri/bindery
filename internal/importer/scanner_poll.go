@@ -200,27 +200,38 @@ func transmissionCompletion(status int, percentDone float64) (complete, stopped 
 func (s *Scanner) checkTransmissionDownloads(ctx context.Context, client *models.DownloadClient) {
 	trans := downloader.TransmissionFor(client)
 
-	// Get torrents — Category is used as a download-directory / label filter so
-	// Bindery only sees its own torrents on a shared instance. GetTorrents
-	// normalises the path comparison and also accepts Transmission 3.0+ labels,
-	// so "books" matches both a downloadDir of "/data/books/" and a label "books".
-	torrents, err := trans.GetTorrents(ctx, client.Category)
-	if err != nil {
-		// Warn, not Debug: see checkSABnzbdDownloads (#1019 failure mode).
-		slog.Warn("download poll: failed to fetch Transmission torrents — downloads will not be imported",
-			"client", client.Name, "error", err)
-		return
-	}
-
+	// Poll every category this client may have grabbed under. Audiobook grabs
+	// use CategoryAudiobook when it is set, ebook grabs use Category, and
+	// polling only Category leaves audiobook torrents invisible: their
+	// downloads then hang at "downloading" for good. CategoriesToPoll returns
+	// both. GetTorrents normalises the path comparison and also accepts
+	// Transmission 3.0+ labels, so "books" matches both a downloadDir of
+	// "/data/books/" and a label "books".
+	//
 	// Torrents are indexed by info hash, which is stable for the life of the
 	// torrent. The numeric id is not: Transmission renumbers every torrent when
-	// the daemon restarts, so an id stored at grab time either matches nothing
-	// (the download strands at "downloading" forever) or matches whichever
-	// unrelated torrent inherited the number.
-	torrentsByHash := make(map[string]transmission.Torrent, len(torrents))
-	for _, t := range torrents {
-		if hash := strings.ToLower(strings.TrimSpace(t.HashString)); hash != "" {
-			torrentsByHash[hash] = t
+	// the daemon restarts.
+	torrentsByHash := make(map[string]transmission.Torrent)
+	var torrents []transmission.Torrent
+	seenTorrentIDs := make(map[int64]bool)
+	for _, cat := range downloader.CategoriesToPoll(client) {
+		found, err := trans.GetTorrents(ctx, cat)
+		if err != nil {
+			// Warn, not Debug: see checkSABnzbdDownloads (#1019 failure mode).
+			slog.Warn("download poll: failed to fetch Transmission torrents — downloads will not be imported",
+				"client", client.Name, "category", cat, "error", err)
+			return
+		}
+		// The two categories can overlap, so a torrent seen twice is kept once.
+		for _, t := range found {
+			if seenTorrentIDs[t.ID] {
+				continue
+			}
+			seenTorrentIDs[t.ID] = true
+			torrents = append(torrents, t)
+			if hash := strings.ToLower(strings.TrimSpace(t.HashString)); hash != "" {
+				torrentsByHash[hash] = t
+			}
 		}
 	}
 
@@ -230,7 +241,7 @@ func (s *Scanner) checkTransmissionDownloads(ctx context.Context, client *models
 	if client.Category != "" && len(torrents) == 0 {
 		if all, allErr := trans.GetTorrents(ctx, ""); allErr == nil && len(all) > 0 {
 			slog.Warn("transmission: Category filter matched zero torrents — verify Category matches the torrent download directory path or a torrent label",
-				"client", client.Name, "category", client.Category, "total_torrents", len(all))
+				"client", client.Name, "category", client.Category, "category_audiobook", client.CategoryAudiobook, "total_torrents", len(all))
 		}
 	}
 
