@@ -5,6 +5,7 @@ package downloader
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -231,20 +232,30 @@ func torrentSavePath(client *models.DownloadClient, opts SendOptions) string {
 	return pathmap.Parse(client.PathRemap).ApplyInverse(localPath)
 }
 
+// errTransmissionSessionID is returned when a removal is asked to act on a
+// download that still stores Transmission's session-scoped numeric id.
+var errTransmissionSessionID = errors.New("this download predates info hash tracking and its stored Transmission id may now belong to a different torrent; refusing to remove by that id, remove the torrent in Transmission")
+
 // RemoveTransmissionTorrent removes a torrent identified by whatever Bindery
 // persisted for it. Anything grabbed since hashes were persisted stores an
-// info hash, which Transmission accepts anywhere an id is taken; rows written
-// before that store the session-scoped numeric id and are removed by id for
-// compatibility. The poller rewrites those rows to the hash as soon as it can
-// confirm the torrent, so the numeric branch is only reached for a download
-// the poller has not yet reconciled.
+// info hash, which Transmission accepts anywhere an id is taken, and is
+// removed by that hash.
+//
+// A row written before that stores the session-scoped numeric id, and it is
+// refused rather than removed. Transmission renumbers every torrent when the
+// daemon restarts, so the number may now name a torrent Bindery never grabbed,
+// and removing it (with its data, for a queue removal that asks for that)
+// cannot be undone (#2808). The poller rewrites such rows to the hash as soon
+// as it can pair them with a torrent unambiguously, so the refusal is only
+// reached for a row it could not pair, which is exactly the row whose torrent
+// Bindery cannot name.
 func RemoveTransmissionTorrent(ctx context.Context, trans *transmission.Client, ref string, deleteFiles bool) error {
 	ref = strings.TrimSpace(ref)
 	if ref == "" {
 		return nil
 	}
-	if torrentID, err := strconv.ParseInt(ref, 10, 64); err == nil {
-		return trans.RemoveTorrent(ctx, torrentID, deleteFiles)
+	if _, err := strconv.ParseInt(ref, 10, 64); err == nil {
+		return fmt.Errorf("transmission torrent %s: %w", ref, errTransmissionSessionID)
 	}
 	return trans.RemoveTorrentByHash(ctx, ref, deleteFiles)
 }
