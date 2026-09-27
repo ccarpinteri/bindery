@@ -86,7 +86,7 @@ func TestCheckTransmissionDownloads_RecoversRenumberedTorrentID(t *testing.T) {
 		t.Fatalf("create download: %v", err)
 	}
 	if err := s.downloads.SetGrabbedAt(ctx, dl.ID, grabbedAt); err != nil {
-		t.Skipf("fixture cannot set grabbed_at: %v", err)
+		t.Fatalf("set grabbed_at: %v", err)
 	}
 
 	s.checkTransmissionDownloads(ctx, client)
@@ -135,7 +135,7 @@ func TestCheckTransmissionDownloads_IgnoresRecycledTorrentID(t *testing.T) {
 		t.Fatalf("create download: %v", err)
 	}
 	if err := s.downloads.SetGrabbedAt(ctx, dl.ID, time.Now().Add(-365*24*time.Hour).UTC()); err != nil {
-		t.Skipf("fixture cannot set grabbed_at: %v", err)
+		t.Fatalf("set grabbed_at: %v", err)
 	}
 
 	s.checkTransmissionDownloads(ctx, client)
@@ -243,4 +243,127 @@ func TestCheckTransmissionDownloads_LegacyBatchDoesNotCollapseOntoOneTorrent(t *
 	assertTorrentID(real, hash, "the download that really is this torrent")
 	assertTorrentID(sibling, "18", "a sibling grabbed in the same window")
 	assertTorrentID(done, "20", "an already-imported download")
+}
+
+// TestCheckTransmissionDownloads_LegacyRowWithTwoNearbyTorrentsIsLeftAlone
+// covers ambiguity on the download's side. One legacy download, and two
+// torrents added inside its window: its own, and an unrelated one another tool
+// dropped into a shared daemon in the same minute. Each torrent sees exactly
+// one candidate download, so a torrent-side check alone pairs the row with
+// whichever torrent the daemon lists first. Here that is the unrelated one,
+// which would import the wrong payload and hand its hash to every later
+// removal. With neither name matching the title the row must be left alone.
+func TestCheckTransmissionDownloads_LegacyRowWithTwoNearbyTorrentsIsLeftAlone(t *testing.T) {
+	grabbedAt := time.Now().Add(-24 * time.Hour).UTC()
+	const (
+		unrelated = "1111111111111111111111111111111111111111"
+		ours      = "2222222222222222222222222222222222222222"
+	)
+	srv := httptest.NewServer(transmissionListHandler(t, []map[string]any{
+		{
+			"id": 1, "hashString": unrelated, "name": "Some.Show.S01E01.1080p",
+			"status": 6, "percentDone": 1.0, "downloadDir": "/downloads",
+			"addedDate": grabbedAt.Add(40 * time.Second).Unix(),
+		},
+		{
+			"id": 2, "hashString": ours, "name": "vance_lantern_daughter",
+			"status": 4, "percentDone": 0.3, "downloadDir": "/downloads",
+			"addedDate": grabbedAt.Unix(),
+		},
+	}))
+	defer srv.Close()
+
+	s, _, _, ctx := scannerFixture(t, t.TempDir())
+	client := transmissionClientFixture(t, s, ctx, srv, "/downloads")
+
+	staleID := "17"
+	dl := &models.Download{
+		GUID:             "guid-two-nearby",
+		DownloadClientID: &client.ID,
+		Title:            "The Lantern Makers Daughter by E. Vance EPUB",
+		NZBURL:           "magnet:?xt=urn:btih:2222",
+		Status:           models.DownloadStatusDownloading,
+		Protocol:         "torrent",
+		TorrentID:        &staleID,
+	}
+	if err := s.downloads.Create(ctx, dl); err != nil {
+		t.Fatalf("create download: %v", err)
+	}
+	if err := s.downloads.SetGrabbedAt(ctx, dl.ID, grabbedAt); err != nil {
+		t.Fatalf("set grabbed_at: %v", err)
+	}
+
+	s.checkTransmissionDownloads(ctx, client)
+
+	got, err := s.downloads.GetByGUID(ctx, dl.GUID)
+	if err != nil {
+		t.Fatalf("get by guid: %v", err)
+	}
+	if got.TorrentID == nil || *got.TorrentID != staleID {
+		t.Fatalf("expected the ambiguous legacy row to keep %q, got %q", staleID, derefTorrentID(got.TorrentID))
+	}
+	if got.Status != models.DownloadStatusDownloading {
+		t.Fatalf("expected status to remain downloading, got %q", got.Status)
+	}
+}
+
+// TestCheckTransmissionDownloads_LegacyRowNameSettlesTwoNearbyTorrents is the
+// companion: when the release name picks out one of the nearby torrents, the
+// row is recovered onto that one regardless of listing order.
+func TestCheckTransmissionDownloads_LegacyRowNameSettlesTwoNearbyTorrents(t *testing.T) {
+	grabbedAt := time.Now().Add(-24 * time.Hour).UTC()
+	const (
+		unrelated = "3333333333333333333333333333333333333333"
+		ours      = "4444444444444444444444444444444444444444"
+	)
+	srv := httptest.NewServer(transmissionListHandler(t, []map[string]any{
+		{
+			"id": 1, "hashString": unrelated, "name": "Some.Show.S01E01.1080p",
+			"status": 4, "percentDone": 0.1, "downloadDir": "/downloads",
+			"addedDate": grabbedAt.Add(40 * time.Second).Unix(),
+		},
+		{
+			"id": 2, "hashString": ours, "name": "The.Lantern.Makers.Daughter.by.E.Vance.EPUB",
+			"status": 4, "percentDone": 0.3, "downloadDir": "/downloads",
+			"addedDate": grabbedAt.Unix(),
+		},
+	}))
+	defer srv.Close()
+
+	s, _, _, ctx := scannerFixture(t, t.TempDir())
+	client := transmissionClientFixture(t, s, ctx, srv, "/downloads")
+
+	staleID := "17"
+	dl := &models.Download{
+		GUID:             "guid-two-nearby-named",
+		DownloadClientID: &client.ID,
+		Title:            "The Lantern Makers Daughter by E Vance EPUB",
+		NZBURL:           "magnet:?xt=urn:btih:4444",
+		Status:           models.DownloadStatusDownloading,
+		Protocol:         "torrent",
+		TorrentID:        &staleID,
+	}
+	if err := s.downloads.Create(ctx, dl); err != nil {
+		t.Fatalf("create download: %v", err)
+	}
+	if err := s.downloads.SetGrabbedAt(ctx, dl.ID, grabbedAt); err != nil {
+		t.Fatalf("set grabbed_at: %v", err)
+	}
+
+	s.checkTransmissionDownloads(ctx, client)
+
+	got, err := s.downloads.GetByGUID(ctx, dl.GUID)
+	if err != nil {
+		t.Fatalf("get by guid: %v", err)
+	}
+	if got.TorrentID == nil || *got.TorrentID != ours {
+		t.Fatalf("expected the row to be recovered onto %q, got %q", ours, derefTorrentID(got.TorrentID))
+	}
+}
+
+func derefTorrentID(id *string) string {
+	if id == nil {
+		return "<nil>"
+	}
+	return *id
 }

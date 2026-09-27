@@ -1004,8 +1004,8 @@ func (s *Scanner) tryImportTransmission(ctx context.Context, dl *models.Download
 const legacyTransmissionMatchWindow = 5 * time.Minute
 
 // reconcileLegacyTransmissionIDs recovers downloads grabbed before the info
-// hash was persisted — their TorrentID holds Transmission's session-scoped
-// numeric id — and backfills the hash so every later poll, import and removal
+// hash was persisted (their TorrentID holds Transmission's session-scoped
+// numeric id) and backfills the hash so every later poll, import and removal
 // keys on a stable value. Same recovery shape as the qBittorrent hash backfill
 // (#939). It returns the torrent matched for each recovered download and
 // rewrites the passed-in rows so the caller sees the new identifier.
@@ -1015,15 +1015,20 @@ const legacyTransmissionMatchWindow = 5 * time.Minute
 // unrelated torrent that inherited the number, and with remove_on_import
 // enabled acting on a wrong match deletes somebody else's torrent.
 //
-// Matching runs from the torrent's side, on addedDate against each download's
-// grab time — the one other field a restart leaves untouched — and a torrent
-// is only claimed when the pairing is unambiguous:
+// Matching compares each torrent's addedDate with each download's grab time,
+// the one other field a restart leaves untouched, and a pairing is accepted
+// only when it is unambiguous from BOTH sides:
 //
-//   - a torrent no download is within the window of is left alone;
-//   - a torrent exactly one download matches is assigned to it;
-//   - a torrent several downloads match (a batch grabbed minutes apart, which
-//     the window alone cannot separate) is assigned only if the release name
-//     picks out exactly one of them, and otherwise left for manual resolution.
+//   - a download and a torrent that are each other's only candidate inside
+//     the window are paired;
+//   - when either side has several candidates (a batch grabbed minutes apart,
+//     or an unrelated torrent another tool added to a shared daemon in the
+//     same minute), the release name has to pick out exactly one partner on
+//     each side, otherwise the rows are left for manual resolution.
+//
+// Checking only the torrent's side is not enough. A single legacy download
+// with its own torrent and an unrelated one inside its window would be handed
+// whichever torrent the daemon happened to list first.
 //
 // Terminal downloads are excluded outright: they will not be imported or
 // removed again, so rewriting their identifier can only ever be wrong, and
@@ -1058,58 +1063,92 @@ func (s *Scanner) reconcileLegacyTransmissionIDs(
 		return nil
 	}
 
-	matches := make(map[int64]transmission.Torrent)
-	assigned := make(map[int64]bool) // download IDs already matched this pass
+	// Torrents that could belong to a legacy row: carrying a hash and an
+	// addedDate, and not already owned by a download that stores that hash.
+	type candidate struct {
+		t    transmission.Torrent
+		hash string
+	}
+	var pool []candidate
 	for _, t := range torrents {
 		hash := strings.ToLower(strings.TrimSpace(t.HashString))
 		if t.AddedDate == 0 || hash == "" || claimedHashes[hash] {
 			continue
 		}
-		addedAt := time.Unix(t.AddedDate, 0)
+		pool = append(pool, candidate{t: t, hash: hash})
+	}
 
-		var inWindow []int
+	// The window relation, indexed both ways: byTorrent[p] lists the legacy
+	// downloads near pool[p], byDownload[i] the pool torrents near downloads[i].
+	byTorrent := make([][]int, len(pool))
+	byDownload := make(map[int][]int, len(legacy))
+	for p, c := range pool {
+		addedAt := time.Unix(c.t.AddedDate, 0)
 		for _, i := range legacy {
-			if assigned[downloads[i].ID] {
-				continue
-			}
 			delta := addedAt.Sub(legacyGrabTime(&downloads[i]))
 			if delta < 0 {
 				delta = -delta
 			}
 			if delta <= legacyTransmissionMatchWindow {
-				inWindow = append(inWindow, i)
+				byTorrent[p] = append(byTorrent[p], i)
+				byDownload[i] = append(byDownload[i], p)
 			}
 		}
-		if len(inWindow) > 1 {
+	}
+
+	matches := make(map[int64]transmission.Torrent)
+	assigned := make(map[int64]bool) // download IDs already matched this pass
+	for p, c := range pool {
+		cands := byTorrent[p]
+		if len(cands) == 0 {
+			continue
+		}
+		pick := -1
+		if len(cands) == 1 && len(byDownload[cands[0]]) == 1 {
+			pick = cands[0]
+		} else {
 			var named []int
-			for _, i := range inWindow {
-				if releaseNamesMatch(t.Name, downloads[i].Title) {
+			for _, i := range cands {
+				if releaseNamesMatch(c.t.Name, downloads[i].Title) {
 					named = append(named, i)
 				}
 			}
-			if len(named) != 1 {
-				slog.Warn("transmission: several downloads were grabbed at this torrent's added time and none is a clear name match — leaving them for manual resolution rather than guessing",
-					"torrent", t.Name, "hash", hash, "candidates", len(inWindow))
+			if len(named) == 1 {
+				// The name must also single this torrent out among every
+				// torrent near the download, or two torrents could each claim
+				// the same row depending on listing order.
+				rivals := 0
+				for _, q := range byDownload[named[0]] {
+					if releaseNamesMatch(pool[q].t.Name, downloads[named[0]].Title) {
+						rivals++
+					}
+				}
+				if rivals == 1 {
+					pick = named[0]
+				}
+			}
+			if pick < 0 {
+				slog.Warn("transmission: a torrent was added close to several grabs, or a grab close to several torrents, and the release name does not settle it; leaving them for manual resolution rather than guessing",
+					"torrent", c.t.Name, "hash", c.hash, "candidate_downloads", len(cands))
 				continue
 			}
-			inWindow = named
 		}
-		if len(inWindow) != 1 {
+		dl := &downloads[pick]
+		if assigned[dl.ID] || claimedHashes[c.hash] {
 			continue
 		}
 
-		dl := &downloads[inWindow[0]]
 		slog.Info("transmission: recovered a download stranded by a renumbered torrent id; backfilling its info hash",
-			"title", dl.Title, "stale_torrent_id", *dl.TorrentID, "current_torrent_id", t.ID, "hash", hash)
-		if err := s.downloads.SetTorrentID(ctx, dl.ID, hash); err != nil {
+			"title", dl.Title, "stale_torrent_id", *dl.TorrentID, "current_torrent_id", c.t.ID, "hash", c.hash)
+		if err := s.downloads.SetTorrentID(ctx, dl.ID, c.hash); err != nil {
 			slog.Warn("transmission: failed to backfill info hash", "download_id", dl.ID, "error", err)
 			continue
 		}
-		h := hash
+		h := c.hash
 		dl.TorrentID = &h
-		claimedHashes[hash] = true
+		claimedHashes[c.hash] = true
 		assigned[dl.ID] = true
-		matches[dl.ID] = t
+		matches[dl.ID] = c.t
 	}
 	return matches
 }
