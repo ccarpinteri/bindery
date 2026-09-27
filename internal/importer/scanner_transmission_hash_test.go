@@ -96,7 +96,7 @@ func TestCheckTransmissionDownloads_RecoversRenumberedTorrentID(t *testing.T) {
 		t.Fatalf("get by guid: %v", err)
 	}
 	if got.TorrentID == nil || *got.TorrentID != hash {
-		t.Fatalf("expected torrent id to be rewritten to the info hash %q, got %v", hash, got.TorrentID)
+		t.Fatalf("expected torrent id to be rewritten to the info hash %q, got %q", hash, derefTorrentID(got.TorrentID))
 	}
 }
 
@@ -366,4 +366,63 @@ func derefTorrentID(id *string) string {
 		return "<nil>"
 	}
 	return *id
+}
+
+// TestCheckTransmissionDownloads_TerminalLegacyRowDoesNotBlockRecovery pins
+// the terminal skip in the legacy reconciler. An imported legacy row and a
+// live one were grabbed a minute apart, only the live one's torrent is still
+// in the daemon, and neither title matches the torrent name. Counting the
+// imported row makes the window ambiguous, so the live download would stay
+// stranded; it must be recovered, and the imported row must keep its id.
+func TestCheckTransmissionDownloads_TerminalLegacyRowDoesNotBlockRecovery(t *testing.T) {
+	grabbedAt := time.Now().Add(-24 * time.Hour).UTC()
+	const hash = "5555555555555555555555555555555555555555"
+	srv := httptest.NewServer(transmissionListHandler(t, []map[string]any{{
+		"id": 1, "hashString": hash, "name": "vance_lantern_daughter",
+		"status": 4, "percentDone": 0.3, "downloadDir": "/downloads",
+		"addedDate": grabbedAt.Add(60 * time.Second).Unix(),
+	}}))
+	defer srv.Close()
+
+	s, _, _, ctx := scannerFixture(t, t.TempDir())
+	client := transmissionClientFixture(t, s, ctx, srv, "/downloads")
+
+	mk := func(guid, title, torrentID string, status models.DownloadState, at time.Time) *models.Download {
+		id := torrentID
+		dl := &models.Download{
+			GUID:             guid,
+			DownloadClientID: &client.ID,
+			Title:            title,
+			NZBURL:           "magnet:?xt=urn:btih:" + torrentID,
+			Status:           status,
+			Protocol:         "torrent",
+			TorrentID:        &id,
+		}
+		if err := s.downloads.Create(ctx, dl); err != nil {
+			t.Fatalf("create download %s: %v", guid, err)
+		}
+		if err := s.downloads.SetGrabbedAt(ctx, dl.ID, at); err != nil {
+			t.Fatalf("set grabbed_at: %v", err)
+		}
+		return dl
+	}
+	done := mk("guid-terminal-done", "An Older Book EPUB", "20", models.StateImported, grabbedAt)
+	live := mk("guid-terminal-live", "The Lantern Makers Daughter EPUB", "21", models.DownloadStatusDownloading, grabbedAt.Add(60*time.Second))
+
+	s.checkTransmissionDownloads(ctx, client)
+
+	gotLive, err := s.downloads.GetByGUID(ctx, live.GUID)
+	if err != nil {
+		t.Fatalf("get by guid: %v", err)
+	}
+	if got := derefTorrentID(gotLive.TorrentID); got != hash {
+		t.Fatalf("expected the live download to be recovered onto %q, got %q", hash, got)
+	}
+	gotDone, err := s.downloads.GetByGUID(ctx, done.GUID)
+	if err != nil {
+		t.Fatalf("get by guid: %v", err)
+	}
+	if got := derefTorrentID(gotDone.TorrentID); got != "20" {
+		t.Fatalf("expected the imported download to keep %q, got %q", "20", got)
+	}
 }
