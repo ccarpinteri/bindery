@@ -1020,7 +1020,7 @@ func (s *Scanner) tryImportTransmission(ctx context.Context, trans *transmission
 		ref := strings.TrimSpace(*dl.TorrentID)
 		cleanup = func() error {
 			slog.Info("removing torrent from Transmission after import", "torrent", ref, "title", dl.Title)
-			// deleteFiles=false: the payload has been imported (hardlinked or
+			// deleteFiles=false: the payload has been imported (hard linked or
 			// copied) but the torrent may still be seeding from those files.
 			if err := downloader.RemoveTransmissionTorrent(ctx, trans, ref, false); err != nil {
 				return fmt.Errorf("remove torrent %s: %w", ref, err)
