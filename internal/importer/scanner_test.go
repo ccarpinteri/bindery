@@ -77,6 +77,26 @@ func TestTitleMatch(t *testing.T) {
 		// Noise titles with no overlap
 		{"Project Hail Mary", "The Lord of the Rings", false},
 		{"Dune", "Foundation Asimov", false},
+
+		// Volumes of one series are different works however many words they
+		// share (#2810): a bare trailing number and an explicit marker alike.
+		{"Defiance of the Fall 17", "Defiance of the Fall 01", false},
+		{"Defiance of the Fall 7", "Defiance of the Fall 17", false},
+		{"Overlord, Vol. 1", "Overlord, Vol. 9", false},
+		// The same volume still matches across zero padding, and an unnumbered
+		// first volume still matches its numbered folder.
+		{"Defiance of the Fall 1", "Defiance of the Fall 01", true},
+		{"Defiance of the Fall", "Defiance of the Fall 01", true},
+		// A number that is part of the title is not a volume.
+		{"Fahrenheit 451", "Ray Bradbury Fahrenheit 451", true},
+		{"Catch-22", "Catch 22", true},
+		{"11/22/63", "11-22-63", true},
+		// A multi-file audiobook's "Part N" counts files, not books, so it
+		// cannot veto a series position spelled another way. Two Part
+		// markers are still two halves of a split edition.
+		{"Rhythm of War (The Stormlight Archive, Book 4)", "Rhythm of War Part 1", true},
+		{"Rhythm of War (The Stormlight Archive #4)", "Rhythm of War Pt. 2 of 3", true},
+		{"The Way of Kings, Part 1", "The Way of Kings, Part 2", false},
 	}
 
 	for _, tt := range tests {

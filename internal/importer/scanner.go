@@ -2649,7 +2649,34 @@ func titleSigTokens(s string) []string {
 // titleMatch returns true when bookTitle and parsedTitle refer to the same work.
 // It handles numeric titles (1984, 2001), article normalization ("Title, The"),
 // and uses dynamic overlap thresholds so short titles still match correctly.
+//
+// Two volumes of one series are never the same work, however many words they
+// share: "Defiance of the Fall 01" and "Defiance of the Fall 17" overlap on
+// every significant token but the number, which clears the two-token threshold
+// below. seriesmatch.DifferentVolumes is the check the series diff and ABS
+// import already apply for exactly this (#1682, #2538); without it here,
+// FindExisting bound a newly added volume 17 to volume 1's file (#2810). It
+// runs through differentVolumes, which does not let a multi-file audiobook's
+// "Part N" stand in for a series position.
 func titleMatch(bookTitle, parsedTitle string) bool {
+	if parsedTitle == "" || bookTitle == "" {
+		return false
+	}
+	if normalizeTitle(bookTitle) == normalizeTitle(parsedTitle) {
+		return true
+	}
+	if differentVolumes(bookTitle, parsedTitle) {
+		return false
+	}
+	return titleWordsMatch(bookTitle, parsedTitle)
+}
+
+// titleWordsMatch is titleMatch without the volume veto: the exact fast path
+// and the significant-token overlap. Only a caller that has already settled
+// the volume from better evidence may use it. FindExisting does when the book
+// folder carries the number, because the filename's numbers are then track
+// numbers ("Defiance of the Fall 7/Defiance of the Fall 01.mp3").
+func titleWordsMatch(bookTitle, parsedTitle string) bool {
 	if parsedTitle == "" || bookTitle == "" {
 		return false
 	}
