@@ -19,6 +19,7 @@ import (
 	"github.com/vavallee/bindery/internal/downloader/sabnzbd"
 	"github.com/vavallee/bindery/internal/downloader/transmission"
 	"github.com/vavallee/bindery/internal/models"
+	"github.com/vavallee/bindery/internal/pathmap"
 )
 
 // checkSABnzbdDownloads polls SABnzbd for status changes.
@@ -683,7 +684,7 @@ func (s *Scanner) checkQbittorrentDownloads(ctx context.Context, client *models.
 				// warning on every cycle forever (#2616). The row's own message
 				// is left alone: recordImportSkip restarts the streak whenever it
 				// changes, and the blocking reason names the missing path.
-				s.skipImportRetry(ctx, &dl, filepath.Join(torrent.SavePath, torrent.Name))
+				s.skipImportRetry(ctx, &dl, pathmap.ClientPathJoin(torrent.SavePath, torrent.Name))
 				continue
 			}
 			downloadPath := s.remapDownloadClientPath(client, rawPath)
@@ -804,7 +805,7 @@ func (s *Scanner) delugeImportSources(ctx context.Context, dlc *deluge.Client, c
 	if savePath == "" {
 		savePath = strings.TrimSpace(t.SavePath)
 	}
-	downloadPath := s.remapDownloadClientPath(client, filepath.Join(savePath, t.Name))
+	downloadPath := s.remapClientJoin(client, savePath, t.Name)
 	return downloadPath, s.delugeFilesFor(ctx, dlc, client, t, savePath)
 }
 
@@ -939,8 +940,9 @@ func (s *Scanner) rtorrentImportSources(ctx context.Context, rt *rtorrent.Client
 	basePath := strings.TrimSpace(t.BasePath)
 	if basePath == "" {
 		// Closed items after an rTorrent restart report an empty base path;
-		// reconstruct it the way rTorrent would have.
-		basePath = filepath.Join(strings.TrimSpace(t.Directory), t.Name)
+		// reconstruct it the way rTorrent would have, in its own namespace
+		// (#2902).
+		basePath = pathmap.ClientPathJoin(strings.TrimSpace(t.Directory), t.Name)
 	}
 	downloadPath := s.remapDownloadClientPath(client, basePath)
 	return downloadPath, s.rtorrentFilesFor(ctx, rt, client, t)
@@ -1015,8 +1017,8 @@ func (s *Scanner) tryImportTransmission(ctx context.Context, dl *models.Download
 const legacyTransmissionMatchWindow = 5 * time.Minute
 
 // reconcileLegacyTransmissionIDs recovers downloads grabbed before the info
-// hash was persisted — their TorrentID holds Transmission's session-scoped
-// numeric id — and backfills the hash so every later poll, import and removal
+// hash was persisted (their TorrentID holds Transmission's session-scoped
+// numeric id) and backfills the hash so every later poll, import and removal
 // keys on a stable value. Same recovery shape as the qBittorrent hash backfill
 // (#939). It returns the torrent matched for each recovered download and
 // rewrites the passed-in rows so the caller sees the new identifier.
@@ -1026,15 +1028,20 @@ const legacyTransmissionMatchWindow = 5 * time.Minute
 // unrelated torrent that inherited the number, and with remove_on_import
 // enabled acting on a wrong match deletes somebody else's torrent.
 //
-// Matching runs from the torrent's side, on addedDate against each download's
-// grab time — the one other field a restart leaves untouched — and a torrent
-// is only claimed when the pairing is unambiguous:
+// Matching compares each torrent's addedDate with each download's grab time,
+// the one other field a restart leaves untouched, and a pairing is accepted
+// only when it is unambiguous from BOTH sides:
 //
-//   - a torrent no download is within the window of is left alone;
-//   - a torrent exactly one download matches is assigned to it;
-//   - a torrent several downloads match (a batch grabbed minutes apart, which
-//     the window alone cannot separate) is assigned only if the release name
-//     picks out exactly one of them, and otherwise left for manual resolution.
+//   - a download and a torrent that are each other's only candidate inside
+//     the window are paired;
+//   - when either side has several candidates (a batch grabbed minutes apart,
+//     or an unrelated torrent another tool added to a shared daemon in the
+//     same minute), the release name has to pick out exactly one partner on
+//     each side, otherwise the rows are left for manual resolution.
+//
+// Checking only the torrent's side is not enough. A single legacy download
+// with its own torrent and an unrelated one inside its window would be handed
+// whichever torrent the daemon happened to list first.
 //
 // Terminal downloads are excluded outright: they will not be imported or
 // removed again, so rewriting their identifier can only ever be wrong, and
@@ -1069,58 +1076,92 @@ func (s *Scanner) reconcileLegacyTransmissionIDs(
 		return nil
 	}
 
-	matches := make(map[int64]transmission.Torrent)
-	assigned := make(map[int64]bool) // download IDs already matched this pass
+	// Torrents that could belong to a legacy row: carrying a hash and an
+	// addedDate, and not already owned by a download that stores that hash.
+	type candidate struct {
+		t    transmission.Torrent
+		hash string
+	}
+	var pool []candidate
 	for _, t := range torrents {
 		hash := strings.ToLower(strings.TrimSpace(t.HashString))
 		if t.AddedDate == 0 || hash == "" || claimedHashes[hash] {
 			continue
 		}
-		addedAt := time.Unix(t.AddedDate, 0)
+		pool = append(pool, candidate{t: t, hash: hash})
+	}
 
-		var inWindow []int
+	// The window relation, indexed both ways: byTorrent[p] lists the legacy
+	// downloads near pool[p], byDownload[i] the pool torrents near downloads[i].
+	byTorrent := make([][]int, len(pool))
+	byDownload := make(map[int][]int, len(legacy))
+	for p, c := range pool {
+		addedAt := time.Unix(c.t.AddedDate, 0)
 		for _, i := range legacy {
-			if assigned[downloads[i].ID] {
-				continue
-			}
 			delta := addedAt.Sub(legacyGrabTime(&downloads[i]))
 			if delta < 0 {
 				delta = -delta
 			}
 			if delta <= legacyTransmissionMatchWindow {
-				inWindow = append(inWindow, i)
+				byTorrent[p] = append(byTorrent[p], i)
+				byDownload[i] = append(byDownload[i], p)
 			}
 		}
-		if len(inWindow) > 1 {
+	}
+
+	matches := make(map[int64]transmission.Torrent)
+	assigned := make(map[int64]bool) // download IDs already matched this pass
+	for p, c := range pool {
+		cands := byTorrent[p]
+		if len(cands) == 0 {
+			continue
+		}
+		pick := -1
+		if len(cands) == 1 && len(byDownload[cands[0]]) == 1 {
+			pick = cands[0]
+		} else {
 			var named []int
-			for _, i := range inWindow {
-				if releaseNamesMatch(t.Name, downloads[i].Title) {
+			for _, i := range cands {
+				if releaseNamesMatch(c.t.Name, downloads[i].Title) {
 					named = append(named, i)
 				}
 			}
-			if len(named) != 1 {
-				slog.Warn("transmission: several downloads were grabbed at this torrent's added time and none is a clear name match — leaving them for manual resolution rather than guessing",
-					"torrent", t.Name, "hash", hash, "candidates", len(inWindow))
+			if len(named) == 1 {
+				// The name must also single this torrent out among every
+				// torrent near the download, or two torrents could each claim
+				// the same row depending on listing order.
+				rivals := 0
+				for _, q := range byDownload[named[0]] {
+					if releaseNamesMatch(pool[q].t.Name, downloads[named[0]].Title) {
+						rivals++
+					}
+				}
+				if rivals == 1 {
+					pick = named[0]
+				}
+			}
+			if pick < 0 {
+				slog.Warn("transmission: a torrent was added close to several grabs, or a grab close to several torrents, and the release name does not settle it; leaving them for manual resolution rather than guessing",
+					"torrent", c.t.Name, "hash", c.hash, "candidate_downloads", len(cands))
 				continue
 			}
-			inWindow = named
 		}
-		if len(inWindow) != 1 {
+		dl := &downloads[pick]
+		if assigned[dl.ID] || claimedHashes[c.hash] {
 			continue
 		}
 
-		dl := &downloads[inWindow[0]]
 		slog.Info("transmission: recovered a download stranded by a renumbered torrent id; backfilling its info hash",
-			"title", dl.Title, "stale_torrent_id", *dl.TorrentID, "current_torrent_id", t.ID, "hash", hash)
-		if err := s.downloads.SetTorrentID(ctx, dl.ID, hash); err != nil {
+			"title", dl.Title, "stale_torrent_id", *dl.TorrentID, "current_torrent_id", c.t.ID, "hash", c.hash)
+		if err := s.downloads.SetTorrentID(ctx, dl.ID, c.hash); err != nil {
 			slog.Warn("transmission: failed to backfill info hash", "download_id", dl.ID, "error", err)
 			continue
 		}
-		h := hash
+		h := c.hash
 		dl.TorrentID = &h
-		claimedHashes[hash] = true
+		claimedHashes[c.hash] = true
 		assigned[dl.ID] = true
-		matches[dl.ID] = t
+		matches[dl.ID] = c.t
 	}
 	return matches
 }
@@ -1198,8 +1239,49 @@ type torrentFile struct {
 // downstream code (cleanupMovedSources, alreadyImportedPath) compares clean
 // forms consistently.
 func (s *Scanner) resolveTorrentFiles(client *models.DownloadClient, clientSavePath string, files []torrentFile) []string {
+	return s.resolveTorrentFilesWithContentFallback(client, clientSavePath, "", files)
+}
+
+// resolveTorrentFilesWithContentFallback is resolveTorrentFiles with a second
+// join base, for clients that speak the qBittorrent API but do not shape the
+// files list the way qBittorrent does (#2878).
+//
+// Real qBittorrent names every file of a multi-file torrent relative to the
+// save path, so the names carry the torrent's root folder
+// ("Release/book.m4b") and save_path + name is the file on disk. rdt-client,
+// and any other qBittorrent emulator that copied its shape, names them
+// relative to the content folder instead ("book.m4b"), so the same join lands
+// one directory too high and every file is reported missing.
+//
+// save_path + name stays the primary join. Only when that file is not on this
+// host does the resolver try clientContentPath + name, and only when:
+//
+//   - clientContentPath is set and differs from the save path (otherwise the
+//     two joins are the same path);
+//   - the remapped content path is a directory on this host (for a single
+//     file torrent content_path is the file itself, and the primary join is
+//     already right);
+//   - the name does not already start with the content folder's base name.
+//     Such a name is qBittorrent's own shape, so joining it onto content_path
+//     would double the root folder ("Release/Release/book.m4b").
+//
+// The candidate is used only when it exists; otherwise the primary path is
+// returned unchanged so filterImportableFiles reports it as missing, exactly
+// as before. Both joins go through the same path remap.
+func (s *Scanner) resolveTorrentFilesWithContentFallback(client *models.DownloadClient, clientSavePath, clientContentPath string, files []torrentFile) []string {
 	if len(files) == 0 || strings.TrimSpace(clientSavePath) == "" {
 		return nil
+	}
+	// The content directory is only stat'ed once, and only after a primary
+	// join misses, so the common qBittorrent path costs no extra syscalls.
+	var contentDir, contentRoot string
+	contentChecked := false
+	contentBase := func() (string, string) {
+		if !contentChecked {
+			contentChecked = true
+			contentDir, contentRoot = s.contentDirForFallback(client, clientSavePath, clientContentPath)
+		}
+		return contentDir, contentRoot
 	}
 	out := make([]string, 0, len(files))
 	for _, f := range files {
@@ -1214,28 +1296,93 @@ func (s *Scanner) resolveTorrentFiles(client *models.DownloadClient, clientSaveP
 		// Join. Splitting and matching per-segment avoids false positives on
 		// legitimate names like "My..Book.epub" while still catching
 		// "MyBook/../escape.epub".
-		if filepath.IsAbs(name) || hasDotDotSegment(name) {
+		// The absolute check covers both namespaces: on a Windows Bindery
+		// filepath.IsAbs does not count "/etc/x" as absolute.
+		if filepath.IsAbs(name) || pathmap.IsAbsClientPath(name) || strings.HasPrefix(name, `\`) || hasDotDotSegment(name) {
 			slog.Warn("import: rejecting malformed file name from download client",
 				"client", client.Name, "name", name)
 			continue
 		}
-		clientPath := filepath.Join(clientSavePath, name)
-		binderyPath := filepath.Clean(s.remapDownloadClientPath(client, clientPath))
+		binderyPath := filepath.Clean(s.remapClientJoin(client, clientSavePath, name))
 		if !IsBookFile(binderyPath) {
 			continue
+		}
+		if clientContentPath != "" && !pathOnHost(binderyPath) {
+			if dir, root := contentBase(); dir != "" && firstPathSegment(name) != root {
+				alt := filepath.Clean(s.remapClientJoin(client, dir, name))
+				if pathOnHost(alt) {
+					slog.Debug("import: file missing under the save path, using the content path as the join base",
+						"client", client.Name, "name", name, "save_path_join", binderyPath, "path", alt)
+					binderyPath = alt
+				}
+			}
 		}
 		out = append(out, binderyPath)
 	}
 	return out
 }
 
+// contentDirForFallback returns the client-side content directory (cleaned)
+// and its base name when it is usable as the second join base described on
+// resolveTorrentFilesWithContentFallback, or two empty strings when it is not.
+// Both are worked out in the client's namespace (#2902); only the stat sees a
+// host path.
+func (s *Scanner) contentDirForFallback(client *models.DownloadClient, clientSavePath, clientContentPath string) (string, string) {
+	dir := strings.TrimSpace(clientContentPath)
+	if dir == "" {
+		return "", ""
+	}
+	dir = pathmap.CleanClientPath(dir)
+	if dir == pathmap.CleanClientPath(clientSavePath) {
+		return "", ""
+	}
+	fi, err := os.Stat(filepath.Clean(s.remapDownloadClientPath(client, dir)))
+	if err != nil || !fi.IsDir() {
+		return "", ""
+	}
+	root := pathmap.ClientPathBase(dir)
+	if root == "" || root == "." {
+		return "", ""
+	}
+	return dir, root
+}
+
+// remapClientJoin joins name onto base the way the download client would,
+// then runs the result through the path remap. The join has to happen in the
+// client's namespace, before the remap: on a Windows Bindery filepath.Join
+// turns a Docker client's "/downloads/x" into "\downloads\x", which a POSIX
+// remap rule such as "/downloads:H:\Downloads" no longer matches, so every
+// file is reported missing (#2902). The caller converts the result to a host
+// path with filepath.Clean.
+func (s *Scanner) remapClientJoin(client *models.DownloadClient, base, name string) string {
+	return s.remapDownloadClientPath(client, pathmap.ClientPathJoin(base, name))
+}
+
+// pathOnHost reports whether anything exists at p, without following a
+// symlink. Whether the entry is importable is filterImportableFiles' call.
+func pathOnHost(p string) bool {
+	_, err := os.Lstat(p)
+	return err == nil
+}
+
+// firstPathSegment returns the leading segment of a client-reported relative
+// file name, accepting either separator.
+func firstPathSegment(name string) string {
+	name = filepath.ToSlash(name)
+	if i := strings.Index(name, "/"); i >= 0 {
+		return name[:i]
+	}
+	return name
+}
+
 // hasDotDotSegment reports whether p contains a ".." path segment under
-// either forward-slash or platform separators. The downloader Files() APIs
-// normalise to forward slash already, but checking both is defensive — a
-// rogue Windows-format response then can't smuggle a "..\\" past the
-// guard.
+// either separator, whatever OS Bindery runs on. The downloader Files() APIs
+// normalise to forward slash already, but checking both is defensive: a
+// rogue Windows-format response then can't smuggle a "..\\" past the guard,
+// and a Windows client's save path is joined with `\` as a separator even on
+// a Linux Bindery.
 func hasDotDotSegment(p string) bool {
-	for _, seg := range strings.Split(filepath.ToSlash(p), "/") {
+	for _, seg := range strings.Split(strings.ReplaceAll(p, `\`, "/"), "/") {
 		if seg == ".." {
 			return true
 		}
@@ -1411,12 +1558,17 @@ func (s *Scanner) transmissionFilesFor(ctx context.Context, trans *transmission.
 // supplied torrent and returns the absolute Bindery-side book-file paths,
 // or nil when the call fails or qBittorrent reported no files yet.
 //
-// SavePath, not ContentPath, is the join base: qBittorrent's files API
-// returns names that include the torrent's display folder (e.g.
+// SavePath, not ContentPath, is the primary join base: qBittorrent's files
+// API returns names that include the torrent's display folder (e.g.
 // "MyBook/file.epub") when the torrent has one, and just the basename for
 // single-file torrents. Joining against SavePath reproduces what's on disk
 // in both cases. ContentPath is the wrong base for multi-file torrents
 // because the file names already include the folder.
+//
+// ContentPath is passed as a fallback base for qBittorrent-compatible clients
+// such as rdt-client, whose files list omits the root folder (#2878). It is
+// consulted only for files missing under SavePath; see
+// resolveTorrentFilesWithContentFallback for the guards.
 func (s *Scanner) qbittorrentFilesFor(ctx context.Context, qb *qbittorrent.Client, client *models.DownloadClient, torrent qbittorrent.Torrent) []string {
 	files, err := qb.Files(ctx, torrent.Hash)
 	if err != nil {
@@ -1433,7 +1585,7 @@ func (s *Scanner) qbittorrentFilesFor(ctx context.Context, qb *qbittorrent.Clien
 	for _, f := range files {
 		conv = append(conv, torrentFile{Name: f.Name, Size: f.Size})
 	}
-	return s.resolveTorrentFiles(client, torrent.SavePath, conv)
+	return s.resolveTorrentFilesWithContentFallback(client, torrent.SavePath, torrent.ContentPath, conv)
 }
 
 func (s *Scanner) remapDownloadClientPath(client *models.DownloadClient, rawPath string) string {
@@ -1448,7 +1600,8 @@ func (s *Scanner) remapDownloadClientPath(client *models.DownloadClient, rawPath
 // (e.g. ':' → '_'). When content_path is available it is used directly.
 //
 // For older clients that omit content_path the function falls back to
-// filepath.Join(SavePath, Name) and verifies the path exists with os.Stat.
+// SavePath + Name, joined in the client's namespace, and verifies the path
+// exists with os.Stat.
 //
 // SavePath is deliberately never returned on its own. For multi-file torrents
 // SavePath is the shared download root; falling back to it would cause Bindery
@@ -1457,7 +1610,7 @@ func resolveQbitContentPath(t qbittorrent.Torrent) (string, bool) {
 	if t.ContentPath != "" {
 		return t.ContentPath, true
 	}
-	candidate := filepath.Join(t.SavePath, t.Name)
+	candidate := pathmap.ClientPathJoin(t.SavePath, t.Name)
 	if _, err := os.Stat(candidate); err == nil {
 		return candidate, true
 	}

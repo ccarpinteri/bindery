@@ -17,6 +17,7 @@ import (
 	"github.com/vavallee/bindery/internal/calibre"
 	"github.com/vavallee/bindery/internal/db"
 	"github.com/vavallee/bindery/internal/httpsec"
+	"github.com/vavallee/bindery/internal/importer"
 	"github.com/vavallee/bindery/internal/metadata/hardcover"
 	"github.com/vavallee/bindery/internal/models"
 	"github.com/vavallee/bindery/internal/pathmap"
@@ -166,8 +167,9 @@ const SettingHardcoverSyncInterval = "hardcover.sync_interval"
 // SettingAuthorDiscoveryInterval is the KV key for how often each monitored
 // author's catalogue is checked for new books by the scheduled discovery job
 // (#2236). Value is "off" or a Go duration string bounded to [24h, 720h].
-// Empty or unset means the default, 168h (weekly). Read on every hourly tick,
-// so a change applies without a restart.
+// Empty or unset means off, like the literal "off": discovery creates library
+// rows on its own, so it runs only once someone stores an interval. Read on
+// every hourly tick, so a change applies without a restart.
 const SettingAuthorDiscoveryInterval = "authors.discovery.interval"
 
 // SettingImportAudiobookFlattenMultiDisc (#886) is "true" to flatten multi-disc
@@ -668,11 +670,14 @@ func validateSettingValue(key, value string) error {
 	case SettingNamingAudiobookFileTemplate:
 		// Empty disables per-file audiobook renaming (#1126). A non-empty
 		// template MUST carry a {Part} token, otherwise every track flattens to
-		// the same filename and all but the last are dropped.
+		// the same filename and all but the last are dropped. The token may
+		// sit in a conditional group ("{Title}{ - Pt. Part:3}.{ext}"), which a
+		// single-file audiobook drops entirely (#2900), so this asks the
+		// renderer rather than looking for the substring "{Part".
 		if value == "" {
 			return nil
 		}
-		if !strings.Contains(value, "{Part") {
+		if !importer.AudiobookTemplateHasPart(value) {
 			return fmt.Errorf("naming.audiobook_file_template must include a {Part} token so each track gets a unique name")
 		}
 	case SettingImportDropLinkMode:
@@ -730,6 +735,15 @@ func validateSettingValue(key, value string) error {
 		}
 		if !calibre.Mode(value).Valid() {
 			return fmt.Errorf("calibre.mode %q is not one of: off, calibredb, plugin", value)
+		}
+	case SettingCalibrePluginTransport:
+		// Empty reads as push. Anything else must be canonical, so a typo
+		// cannot quietly leave both the push worker and the bridge idle.
+		if value == "" {
+			return nil
+		}
+		if !calibre.Transport(value).Valid() {
+			return fmt.Errorf("calibre.plugin_transport %q is not one of: push, pull", value)
 		}
 	case SettingDefaultMediaType:
 		// Empty falls back to ebook at read time; only validate non-empty
@@ -871,9 +885,9 @@ func validateSettingValue(key, value string) error {
 			return fmt.Errorf("hardcover.sync_interval %q exceeds the maximum of 168h (7 days)", value)
 		}
 	case SettingAuthorDiscoveryInterval:
-		// Empty = unset (weekly default). "off" stops scheduled discovery.
-		// Below a day every author would be re-checked faster than a
-		// provider's cache turns over, above 30 days it stops being a cadence.
+		// Empty = unset, which means off, as does "off" itself. Below a day
+		// every author would be re-checked faster than a provider's cache
+		// turns over, above 30 days it stops being a cadence.
 		if value == "" || value == "off" {
 			return nil
 		}

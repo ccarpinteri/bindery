@@ -64,6 +64,8 @@ vi.mock('react-i18next', () => ({
         'wanted.colActions': 'Actions',
         'wanted.noCover': 'No cover',
         'wanted.authorUnknown': 'Author unknown',
+        'wanted.authorNotMonitored': 'Author not monitored, so this is not searched automatically',
+        'search.autoGrabDisabled': 'No search was run. Automatic grabbing is off.',
       }
       return labels[key] ?? key
     },
@@ -451,6 +453,40 @@ describe('WantedPage', () => {
     expect(screen.queryByRole('link', { name: 'Dune' })).not.toBeInTheDocument()
     expect(screen.queryByRole('link', { name: 'Hyperion' })).not.toBeInTheDocument()
   })
+
+  // #2669: with automatic grabbing off the server refuses the search instead
+  // of queueing it. Before the fix every entry came back ok:true, the page
+  // cleared the selection and reloaded, and the user saw a button flash and
+  // no other sign that nothing had happened.
+  it('tells the user nothing was searched when automatic grabbing is off, and keeps the selection', async () => {
+    vi.mocked(api.listWanted).mockResolvedValue([
+      makeBook({ id: 1, title: 'Dune' }),
+      makeBook({ id: 2, title: 'Hyperion' }),
+    ])
+    vi.mocked(api.bulkActionWanted).mockResolvedValue({
+      results: {
+        1: { ok: false, code: 'auto_grab_disabled', error: 'automatic grabbing is disabled' },
+        2: { ok: false, code: 'auto_grab_disabled', error: 'automatic grabbing is disabled' },
+      },
+    })
+
+    renderWantedPage()
+
+    await screen.findByRole('link', { name: 'Dune' })
+    fireEvent.click(screen.getByTitle('Select Dune'))
+    fireEvent.click(screen.getByTitle('Select Hyperion'))
+
+    const bulkBar = screen.getByText('2 selected').closest('div')
+    if (!bulkBar) throw new Error('Bulk action bar was not rendered')
+    fireEvent.click(within(bulkBar).getByRole('button', { name: 'Search' }))
+
+    expect(await screen.findByText('No search was run. Automatic grabbing is off.')).toBeInTheDocument()
+    // The selection survives, so flipping the setting and pressing Search
+    // again does not mean re-picking every book.
+    expect(screen.getByText('2 selected')).toBeInTheDocument()
+    // And the list is not reloaded, because nothing changed.
+    expect(api.listWanted).toHaveBeenCalledTimes(1)
+  })
 })
 
 describe('WantedPage — live polling (#1161)', () => {
@@ -511,5 +547,27 @@ describe('WantedPage — book link nav state (#2548, book side)', () => {
 
     await waitFor(() => expect(located?.pathname).toBe('/book/2'))
     expect(located?.state).toEqual({ ids: [2], index: 0, hopDepth: 1 })
+  })
+})
+
+// A book whose author is unmonitored is never searched by the sweep (#2742),
+// so on this page it is indistinguishable from one whose grab is slow. The row
+// says which it is, and only for the rows it applies to.
+describe('WantedPage author monitoring hint', () => {
+  it('explains a row the sweep will not search, and leaves the others alone', async () => {
+    vi.mocked(api.listWanted).mockResolvedValue([
+      makeBook({ id: 1, title: 'Dune', authorUnmonitored: true }),
+      makeBook({ id: 2, title: 'Messiah' }),
+    ])
+
+    render(
+      <MemoryRouter>
+        <WantedPage />
+      </MemoryRouter>,
+    )
+
+    await screen.findByText('Dune')
+    const hints = screen.getAllByText('Author not monitored, so this is not searched automatically')
+    expect(hints).toHaveLength(1)
   })
 })
