@@ -257,7 +257,7 @@ function EditClientForm({ client, onClose, onSaved }: { client: DownloadClient; 
       category,
       categoryAudiobook: categoryAudiobook.trim(),
       pathRemap: pathRemap.trim(),
-      removeOnImport: isTorrentClient(type) ? removeOnImport : false,
+      removeOnImport: supportsRemoveOnImport(type) ? removeOnImport : false,
       useSsl: useSSL,
       urlBase: urlBase.trim(),
     }
@@ -396,7 +396,7 @@ function EditClientForm({ client, onClose, onSaved }: { client: DownloadClient; 
         placeholder={type === 'qbittorrent' ? '/downloads:/media/books' : '/media:/books'}
         help={downloadClientPathRemapHelp(type)}
       />
-      {isTorrentClient(type) && (
+      {supportsRemoveOnImport(type) && (
         <div>
           <div className="flex items-center gap-2">
             <input
@@ -433,10 +433,13 @@ function EditClientForm({ client, onClose, onSaved }: { client: DownloadClient; 
   )
 }
 
-// Torrent clients only: a usenet client always clears its own history entry
-// once Bindery has imported the job, so there is nothing for the toggle to
-// control there. Mirrors downloader.IsTorrentClient on the server.
-const isTorrentClient = (t: string) => t === 'qbittorrent' || t === 'transmission' || t === 'deluge' || t === 'rtorrent'
+// The clients whose import path removes the torrent when the toggle is on:
+// tryImportQbittorrent and tryImportTransmission in the scanner. A usenet
+// client always clears its own history entry once Bindery has imported the
+// job, so there is nothing for the toggle to control there. Deluge and
+// rTorrent have no removal wired up yet, so showing them the toggle would
+// store a choice that does nothing.
+const supportsRemoveOnImport = (t: string) => t === 'qbittorrent' || t === 'transmission'
 
 function AddClientForm({ onClose, onAdded }: { onClose: () => void; onAdded: (c: DownloadClient) => void }) {
   const { t } = useTranslation()
@@ -507,7 +510,7 @@ function AddClientForm({ onClose, onAdded }: { onClose: () => void; onAdded: (c:
     ...(isPasswordClient(type)
       ? { name, host, port: parseInt(port), username: hasUsername(type) ? username : '', password: credential, apiKey: '', category, categoryAudiobook: categoryAudiobook.trim(), pathRemap: pathRemap.trim(), type, enabled: true, useSsl: useSSL, urlBase: urlBase.trim() }
       : { name, host, port: parseInt(port), apiKey: credential, username: '', password: '', category, categoryAudiobook: categoryAudiobook.trim(), pathRemap: pathRemap.trim(), type, enabled: true, useSsl: useSSL, urlBase: urlBase.trim() }),
-    ...(isTorrentClient(type) ? { removeOnImport } : {}),
+    ...(supportsRemoveOnImport(type) ? { removeOnImport } : {}),
   })
 
   const submit = async () => {
@@ -623,7 +626,7 @@ function AddClientForm({ onClose, onAdded }: { onClose: () => void; onAdded: (c:
         placeholder={type === 'qbittorrent' ? '/downloads:/media/books' : '/media:/books'}
         help={downloadClientPathRemapHelp(type)}
       />
-      {isTorrentClient(type) && (
+      {supportsRemoveOnImport(type) && (
         <div>
           <div className="flex items-center gap-2">
             <input

@@ -14,6 +14,7 @@ import { useView } from '../components/useView'
 import MarkdownDescription from '../components/MarkdownDescription'
 import { canLinkAuthorMetadata } from '../util/authorMetadata'
 import { metadataSourceLink } from '../util/metadataSource'
+import { isAutoGrabRefusal } from '../util/autoGrabRefusal'
 import { btn, btnSize } from '../components/buttons'
 import Switch from '../components/Switch'
 import CoverPlaceholder from '../components/CoverPlaceholder'
@@ -21,6 +22,7 @@ import MoreMenu from '../components/MoreMenu'
 import Section from '../components/Section'
 import AuthorSyncNotice from '../components/AuthorSyncNotice'
 import CatalogueReconciliationModal from '../components/CatalogueReconciliationModal'
+import DuplicateCandidatesModal from '../components/DuplicateCandidatesModal'
 
 type MediaFilter = '' | 'ebook' | 'audiobook'
 // 'excluded' folds in what used to be a separate "Show excluded" checkbox. It
@@ -122,6 +124,7 @@ export default function AuthorDetailPage() {
   const [showRename, setShowRename] = useState(false)
   const [showMetadataLink, setShowMetadataLink] = useState(false)
   const [showCatalogueReconciliation, setShowCatalogueReconciliation] = useState(false)
+  const [showDuplicateCandidates, setShowDuplicateCandidates] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   // Bulk multi-select state (#791). Selection is keyed by book.id and
@@ -352,6 +355,14 @@ export default function AuthorDetailPage() {
     setError(null)
     try {
       const res = await api.searchAuthorWanted(author.id)
+      // A refusal because automatic grabbing is off is not a failure of this
+      // author's search, it is a setting the user has to change, so it gets
+      // its own message naming the setting instead of a raw server string
+      // (#2669).
+      if (isAutoGrabRefusal(res)) {
+        setError(t('search.autoGrabDisabled'))
+        return
+      }
       const item = res.results[String(author.id)]
       if (item && !item.ok) {
         throw new Error(item.error || 'Search failed')
@@ -439,6 +450,13 @@ export default function AuthorDetailPage() {
     try {
       const ids = Array.from(selected)
       const res = await api.bulkActionBooks(ids, action, mediaType)
+      // Same refusal as the "Search wanted" button: say what did not happen
+      // and keep the selection so the user can retry after flipping the
+      // setting (#2669).
+      if (isAutoGrabRefusal(res)) {
+        setError(t('search.autoGrabDisabled'))
+        return
+      }
       let okCount = 0
       let firstError = ''
       for (const id of ids) {
@@ -925,6 +943,7 @@ export default function AuthorDetailPage() {
               onClick={handleRefresh}
               disabled={refreshing}
               className={`${btn.secondary} ${btnSize.sm}`}
+              title={t('authorDetail.actions.refreshHint', "Fetch this author's catalogue from the metadata provider again. Books you do not have are added according to Monitor new items. Nothing is downloaded until the next wanted search.")}
             >
               {refreshing ? t('authorDetail.actions.refreshing', 'Refreshing…') : t('authorDetail.actions.refresh', 'Refresh')}
             </button>
@@ -962,6 +981,11 @@ export default function AuthorDetailPage() {
                   label: t('authorDetail.actions.reconcileCatalogue', 'Reconcile catalogue…'),
                   title: t('authorDetail.actions.reconcileCatalogueHint', 'Preview stale metadata-only Wanted rows before removing them'),
                   onSelect: () => setShowCatalogueReconciliation(true),
+                },
+                {
+                  label: t('authorDetail.actions.reviewDuplicates', 'Review duplicates…'),
+                  title: t('authorDetail.actions.reviewDuplicatesHint', 'Find titles that look like the same book; nothing changes until you exclude a row'),
+                  onSelect: () => setShowDuplicateCandidates(true),
                 },
                 {
                   label: t('authorDetail.actions.delete', 'Delete'),
@@ -1036,6 +1060,15 @@ export default function AuthorDetailPage() {
           authorName={author.authorName}
           onClose={() => setShowCatalogueReconciliation(false)}
           onApplied={reloadBooks}
+        />
+      )}
+
+      {showDuplicateCandidates && (
+        <DuplicateCandidatesModal
+          authorId={author.id}
+          authorName={author.authorName}
+          onClose={() => setShowDuplicateCandidates(false)}
+          onChanged={reloadBooks}
         />
       )}
 

@@ -61,6 +61,13 @@ func TestSettingDescriptors_WellFormed(t *testing.T) {
 					continue
 				}
 				if _, err := time.ParseDuration(v); err != nil {
+					// A default may be a sentinel instead of a duration, as
+					// "off" is for authors.discovery.interval, but only one
+					// the key's own validator accepts. Bounds have no such
+					// licence: a min or max must be a real duration.
+					if name == "default" && validateSettingValue(d.Key, v) == nil {
+						continue
+					}
 					t.Errorf("%s: duration %s %q does not parse: %v", d.Key, name, v, err)
 				}
 			}
@@ -345,6 +352,11 @@ func TestValidateSettingValue_KnownKeysUnchanged(t *testing.T) {
 		{"primary provider accepts empty", SettingMetadataPrimaryProvider, "", false},
 		{"primary provider rejects goodreads", SettingMetadataPrimaryProvider, "goodreads", true},
 
+		{"plugin transport accepts push", SettingCalibrePluginTransport, "push", false},
+		{"plugin transport accepts pull", SettingCalibrePluginTransport, "pull", false},
+		{"plugin transport accepts empty", SettingCalibrePluginTransport, "", false},
+		{"plugin transport rejects poll", SettingCalibrePluginTransport, "poll", true},
+
 		{"push path remap accepts a pair", SettingCalibrePushPathRemap, "/books:/library", false},
 		{"push path remap accepts empty", SettingCalibrePushPathRemap, "", false},
 		{"push path remap rejects a malformed pair", SettingCalibrePushPathRemap, "/books", true},
@@ -380,6 +392,7 @@ func TestValidateSettingValue_KnownKeysUnchanged(t *testing.T) {
 		{"discovery interval accepts off", SettingAuthorDiscoveryInterval, "off", false},
 		{"discovery interval accepts empty", SettingAuthorDiscoveryInterval, "", false},
 		{"discovery interval accepts daily", SettingAuthorDiscoveryInterval, "24h", false},
+		{"discovery interval accepts weekly", SettingAuthorDiscoveryInterval, "168h", false},
 		{"discovery interval accepts monthly", SettingAuthorDiscoveryInterval, "720h", false},
 		{"discovery interval rejects gibberish", SettingAuthorDiscoveryInterval, "weekly", true},
 		{"discovery interval rejects under a day", SettingAuthorDiscoveryInterval, "6h", true},
@@ -430,6 +443,7 @@ var webSettingKeys = []string{
 	"calibre.library_path",
 	"calibre.mode",
 	"calibre.plugin_api_key",
+	"calibre.plugin_transport",
 	"calibre.plugin_url",
 	"calibre.push_path_remap",
 	"calibre.sync_on_startup",
@@ -555,6 +569,19 @@ func TestSettingsHandler_Descriptors(t *testing.T) {
 	}
 	if !interval.RestartRequired {
 		t.Errorf("%s is read once at scheduler start, so restartRequired must survive the wire", SettingSearchInterval)
+	}
+	// Discovery ships off: the descriptor is what a client renders as the
+	// selected state before anything is stored, and the bounds stay as they
+	// were so an operator who turns it on has the same choices.
+	discovery, ok := byKey[SettingAuthorDiscoveryInterval]
+	if !ok {
+		t.Fatalf("%s missing from the served registry", SettingAuthorDiscoveryInterval)
+	}
+	if discovery.Default != "off" || discovery.Min != "24h" || discovery.Max != "720h" {
+		t.Errorf("%s served as %+v, want default off within [24h, 720h]", SettingAuthorDiscoveryInterval, discovery)
+	}
+	if discovery.RestartRequired {
+		t.Errorf("%s is re-read every tick, so restartRequired must stay false", SettingAuthorDiscoveryInterval)
 	}
 	if token := byKey[SettingHardcoverAPIToken]; !token.Secret || !token.Writable {
 		t.Errorf("%s served as secret=%v writable=%v, want secret and still writable", SettingHardcoverAPIToken, token.Secret, token.Writable)

@@ -1780,9 +1780,10 @@ describe('SettingsPage', () => {
         enabled: true,
         useSsl: false,
         urlBase: '',
-        // Torrent clients carry the remove-on-import toggle, off by default.
-        // A usenet client has no torrent to remove, so the form omits it.
-        ...(type === 'nzbget' ? {} : { removeOnImport: false }),
+        // qBittorrent and Transmission carry the remove-on-import toggle, off
+        // by default. The other clients have no removal wired up, so the form
+        // omits it.
+        ...(type === 'qbittorrent' || type === 'transmission' ? { removeOnImport: false } : {}),
       })
     })
   })

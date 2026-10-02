@@ -265,6 +265,13 @@ describe('download client remove-on-import toggle', () => {
     expect(screen.queryByLabelText('settings.clients.removeOnImportLabel')).not.toBeInTheDocument()
   })
 
+  it.each(['deluge', 'rtorrent'])('is hidden for %s, whose import path does not remove torrents', type => {
+    renderTab([makeClient({ type })])
+    openEditForm()
+
+    expect(screen.queryByLabelText('settings.clients.removeOnImportLabel')).not.toBeInTheDocument()
+  })
+
   it('is shown for a torrent client and reflects the stored value', () => {
     renderTab([makeClient({ type: 'transmission', removeOnImport: true })])
     openEditForm()

@@ -9,6 +9,7 @@ import ClipboardManualFallback from '../../components/ClipboardManualFallback'
 import { useClipboardCopy } from '../../components/useClipboardCopy'
 import { useAuth } from '../../auth/AuthContext'
 import { inputCls } from './formStyles'
+import RenameFilesModal from '../../components/RenameFilesModal'
 import NamingTemplateField from './NamingTemplateField'
 import SaveButton from './SaveButton'
 import { useSaveResult } from './useSaveResult'
@@ -38,6 +39,7 @@ export default function GeneralTab({ onNavigate }: GeneralTabProps = {}) {
   const [dropErr, setDropErr] = useState<string | null>(null)
   const [langErr, setLangErr] = useState<string | null>(null)
   const [scanningLibrary, setScanningLibrary] = useState(false)
+  const [showReorganize, setShowReorganize] = useState(false)
   const [scanMessage, setScanMessage] = useState<string | null>(null)
   const scanStartedAt = useRef<number>(0)
   const [lastScan, setLastScan] = useState<{
@@ -179,7 +181,9 @@ export default function GeneralTab({ onNavigate }: GeneralTabProps = {}) {
   // its own option rather than letting the select render blank (#1848).
   const hardcoverSyncInterval = settings['hardcover.sync_interval'] ?? '24h'
   const hardcoverSyncIntervalIsCustom = !HARDCOVER_SYNC_INTERVAL_PRESETS.includes(hardcoverSyncInterval)
-  const discoveryInterval = settings['authors.discovery.interval'] || '168h'
+  // Discovery ships off (#2236): nothing stored means Off, not the weekly
+  // default the other cadences fall back to.
+  const discoveryInterval = settings['authors.discovery.interval'] || 'off'
   const discoveryIntervalIsCustom = !DISCOVERY_INTERVAL_PRESETS.includes(discoveryInterval)
 
   if (loading) return <div className="text-slate-600 dark:text-zinc-500">{t('common.loading')}</div>
@@ -219,8 +223,12 @@ export default function GeneralTab({ onNavigate }: GeneralTabProps = {}) {
           <div>
             <label className="block text-xs text-slate-600 dark:text-zinc-400 mb-1">Import Mode</label>
             <p className="text-xs text-slate-600 dark:text-zinc-500 mb-2">
-              How Bindery places completed downloads into the library.
-              <strong>Auto</strong> (the default) hardlinks when the download folder and library share a volume, otherwise copies — either way the source stays in place so torrent seeding keeps working.
+              {/* JSX drops the newline between a text line and a following
+                  <strong> on the next line, so each sentence that ends right
+                  before one needs an explicit {' '} or it renders glued
+                  ("the library.Auto (the default)"). */}
+              How Bindery places completed downloads into the library.{' '}
+              <strong>Auto</strong> (the default) hardlinks when the download folder and library share a volume, otherwise copies — either way the source stays in place so torrent seeding keeps working.{' '}
               <strong>Move</strong> relocates the source out of the download folder, which breaks seeding.
               Use <strong>Hardlink</strong> or <strong>Copy</strong> to force keeping the source file intact; Hardlink requires the download folder and library to be on the same filesystem/volume.
               Use <strong>External</strong> if another tool (Calibre, Grimmory, etc.) manages your library — Bindery grabs the download and stops; your tool processes it, then Bindery reconciles on the next library scan.
@@ -385,7 +393,7 @@ export default function GeneralTab({ onNavigate }: GeneralTabProps = {}) {
               {t('settings.general.audiobookFileTemplate', 'Audiobook file naming (per track)')}
             </label>
             <p className="text-xs text-slate-600 dark:text-zinc-500 mb-2">
-              {t('settings.general.audiobookFileTemplateHint', 'Leave empty to keep the download’s original file layout. Set a template to rename every audiobook track in playback order — it must include {Part}.')}
+              {t('settings.general.audiobookFileTemplateHint', 'Leave empty to keep the download’s original file layout. Set a template to rename every audiobook track in playback order; it must include {Part}. A single-file audiobook is renamed too, as part 1, unless {Part} sits in a group with its own text, such as {Title}{ - Pt. Part:3}.{ext}, which is left out when there is only one file.')}
             </p>
             <div className="flex gap-2">
               <input
@@ -581,7 +589,32 @@ export default function GeneralTab({ onNavigate }: GeneralTabProps = {}) {
               )}
             </div>
           )}
+          {/* #2296: reorganize has had a library scope on the server since
+              #1181 but was only ever mounted per author and per book. It sits
+              below the scan on purpose: reorganize moves files that are
+              already attached to a book, so a file no scan has matched is
+              invisible to it. */}
+          <div className="mt-3 border-t border-slate-200 dark:border-zinc-800 pt-3 flex items-center justify-between gap-4">
+            <div>
+              <p className="text-sm text-slate-700 dark:text-zinc-300">{t('settings.general.reorganizeLibrary')}</p>
+              <p className="text-xs text-slate-600 dark:text-zinc-500 mt-0.5">{t('settings.general.reorganizeLibraryHint')}</p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setShowReorganize(true)}
+              className="px-4 py-2 bg-slate-600 hover:bg-slate-500 rounded text-sm font-medium disabled:opacity-50 flex-shrink-0"
+            >
+              {t('settings.general.reorganizeLibraryButton')}
+            </button>
+          </div>
         </div>
+        {showReorganize && (
+          <RenameFilesModal
+            scope="library"
+            label={t('settings.general.reorganizeLibraryLabel')}
+            onClose={() => setShowReorganize(false)}
+          />
+        )}
       </section>
 
       {/* Wanted search interval */}

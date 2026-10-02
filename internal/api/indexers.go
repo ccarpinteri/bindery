@@ -526,12 +526,20 @@ func (h *IndexerHandler) SearchBook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	crit := indexer.MatchCriteria{
-		Title:            book.Title,
+		Title:            indexer.SearchTitle(*book, allowedLangs),
 		Author:           authorName,
 		MediaType:        book.MediaType,
 		ASIN:             book.ASIN,
 		AllowedLanguages: allowedLangs,
 		AuthorAliases:    authorAliases,
+		// The searcher ranks by the profile's order (#2733); the same profile
+		// builds the QualityAllowed annotation below, so the book page's
+		// order and its approved flags come from one definition.
+		Profile: qualityProfile,
+		// The book's stored runtime lets the size term score an audio release
+		// by its density instead of its total size; zero keeps the flat bonus
+		// (#2740).
+		DurationSeconds: book.DurationSeconds,
 	}
 	if book.ReleaseDate != nil {
 		crit.Year = book.ReleaseDate.Year()
@@ -551,6 +559,8 @@ func (h *IndexerHandler) SearchBook(w http.ResponseWriter, r *http.Request) {
 	var results []newznab.SearchResult
 	var dbg *indexer.SearchDebug
 	if book.MediaType == models.MediaTypeBoth {
+		// Both legs copy crit, so each carries the profile and ranks by its
+		// own list: ebooks by the ebook list, audiobooks by the audiobook list.
 		ebookCrit := crit
 		ebookCrit.MediaType = models.MediaTypeEbook
 		audioCrit := crit
@@ -581,6 +591,11 @@ func (h *IndexerHandler) SearchBook(w http.ResponseWriter, r *http.Request) {
 		audioOut := <-audioCh
 		ebookResults, ebookDbg := ebookOut.results, ebookOut.dbg
 		audioResults, audioDbg := audioOut.results, audioOut.dbg
+		// The ebook block then the audiobook block, as it has always been.
+		// What is new is that each block is ranked by its own list, and the
+		// two legs' scores are not comparable (each list ranks n down to 1
+		// over its own length), so concatenating rather than interleaving by
+		// score is now load bearing rather than incidental.
 		results = append(ebookResults, audioResults...)
 		results = indexer.DedupeResults(results)
 		// Merge debug info from both searches.
@@ -639,8 +654,11 @@ func (h *IndexerHandler) SearchBook(w http.ResponseWriter, r *http.Request) {
 	specs = append(specs, decision.AlreadyImportedSpec{})
 
 	// Allowed-formats spec (#1693). Annotates only — see WithQualityProfiles.
+	// The media type decides which of the profile's two lists judges a release
+	// (#2733). For a dual-format book this is "both", which the spec ignores in
+	// favour of the per-result media type the two legs stamped above.
 	if qualityProfile != nil {
-		specs = append(specs, decision.QualityAllowed{Profile: qualityProfile})
+		specs = append(specs, decision.QualityAllowed{Profile: qualityProfile, MediaType: book.MediaType})
 	}
 
 	dm := decision.New(specs...)

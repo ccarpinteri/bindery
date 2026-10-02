@@ -12,6 +12,8 @@ import MoreMenu from '../components/MoreMenu'
 import Pagination from '../components/Pagination'
 import { useServerPagination } from '../components/usePagination'
 import ViewToggle from '../components/ViewToggle'
+import BulkNotice from '../components/BulkNotice'
+import { isAutoGrabRefusal } from '../util/autoGrabRefusal'
 import { useView } from '../components/useView'
 import SetupChecklist from '../components/SetupChecklist'
 import { btn, btnSize } from '../components/buttons'
@@ -44,6 +46,12 @@ export default function AuthorsPage() {
   const [showAddSeries, setShowAddSeries] = useState(false)
   const [showMerge, setShowMerge] = useState(false)
   const [showMonitorModeBulk, setShowMonitorModeBulk] = useState(false)
+  // Which of Monitor / Unmonitor the bulk bar is asking about, and whether the
+  // answer should reach the authors' existing books (#2742). Null means the
+  // dialog is closed. The cascade defaults to off, matching the single author
+  // path, so the action a user already knows keeps doing exactly what it did.
+  const [monitoringBulkAction, setMonitoringBulkAction] = useState<'monitor' | 'unmonitor' | null>(null)
+  const [bulkApplyMonitoringToExisting, setBulkApplyMonitoringToExisting] = useState(false)
   const [bulkMonitorMode, setBulkMonitorMode] = useState<AuthorBulkMonitorMode>('none')
   const [bulkMonitorLatestCount, setBulkMonitorLatestCount] = useState(1)
   const [bulkApplyMonitorModeToExisting, setBulkApplyMonitorModeToExisting] = useState(true)
@@ -64,6 +72,9 @@ export default function AuthorsPage() {
   const [view, setView] = useView('authors', 'grid')
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [bulkBusy, setBulkBusy] = useState(false)
+  // A message from the last bulk action that is not an exception, e.g. the
+  // server refusing a search because automatic grabbing is off (#2669).
+  const [bulkNotice, setBulkNotice] = useState<string | null>(null)
   const selectAllRef = useRef<HTMLInputElement>(null)
   // "Refresh all metadata" background job (#863). refreshStatus mirrors the
   // persisted server-side progress; refreshing is the in-flight flag that drives
@@ -217,7 +228,7 @@ export default function AuthorsPage() {
   }
   const clearSelection = () => setSelectedIds(new Set())
 
-  const runBulk = async (action: Parameters<typeof api.bulkActionAuthors>[1]) => {
+  const runBulk = async (action: Parameters<typeof api.bulkActionAuthors>[1], applyToExisting = false) => {
     if (selectedIds.size === 0) return
     if (action === 'delete' && !await confirm({
       title: t('common.confirmTitle'),
@@ -225,8 +236,15 @@ export default function AuthorsPage() {
       confirmLabel: t('common.delete'),
     })) return
     setBulkBusy(true)
+    setBulkNotice(null)
     try {
-      await api.bulkActionAuthors([...selectedIds], action)
+      const res = await api.bulkActionAuthors([...selectedIds], action, undefined, applyToExisting)
+      // Same refusal as every other bulk Search surface (#2669): the selection
+      // survives and the list is not reloaded, because nothing happened.
+      if (isAutoGrabRefusal(res)) {
+        setBulkNotice(t('search.autoGrabDisabled'))
+        return
+      }
       clearSelection()
       load()
     } catch (err) {
@@ -301,6 +319,20 @@ export default function AuthorsPage() {
     }
   }
 
+  const openMonitoringBulk = (action: 'monitor' | 'unmonitor') => {
+    if (selectedIds.size === 0) return
+    setBulkApplyMonitoringToExisting(false)
+    setMonitoringBulkAction(action)
+  }
+
+  const runMonitoringBulk = async () => {
+    if (!monitoringBulkAction) return
+    const action = monitoringBulkAction
+    const applyToExisting = bulkApplyMonitoringToExisting
+    setMonitoringBulkAction(null)
+    await runBulk(action, applyToExisting)
+  }
+
   const handleCreateSeries = async (title: string) => {
     const series = await api.createSeries({ title })
     setShowAddSeries(false)
@@ -349,9 +381,15 @@ export default function AuthorsPage() {
   return (
     <div className={selectedIds.size > 0 ? 'pb-16' : ''}>
       {confirmDialog}
-      <div className="flex items-center justify-between mb-4">
-        <h2 className="text-2xl font-bold">{t('authors.title')}</h2>
-        <div className="flex items-center gap-2 flex-wrap justify-end">
+      <BulkNotice message={bulkNotice} onDismiss={() => setBulkNotice(null)} />
+      {/* Page header. The outer row wraps and the toolbar is pinned to the
+          container width below `sm`, so a phone puts the buttons on their own
+          lines under the title instead of letting the group claim more room
+          than the viewport has. Books, Series and History already lay their
+          headers out this way. */}
+      <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+        <h2 className="text-2xl font-bold min-w-0">{t('authors.title')}</h2>
+        <div className="flex items-center gap-2 flex-wrap w-full sm:w-auto justify-start sm:justify-end">
           <ViewToggle view={view} onChange={setView} />
           <button
             onClick={handleRefreshAll}
@@ -381,9 +419,14 @@ export default function AuthorsPage() {
           >
             Add Series
           </button>
+          {/* Below `sm` the five buttons wrap and the primary action used to
+              land on the second row, under Refresh all metadata, Merge and Add
+              Book. `order-first` pulls it to the front of the wrapped group on a
+              phone only; the DOM order is untouched, so the desktop row keeps
+              its usual secondary-then-primary reading order. */}
           <button
             onClick={() => setAddMode('author')}
-            className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 rounded-md text-sm font-medium transition-colors"
+            className="order-first sm:order-none px-4 py-2 bg-emerald-600 hover:bg-emerald-500 rounded-md text-sm font-medium transition-colors"
           >
             {t('authors.addAuthor')}
           </button>
@@ -623,8 +666,8 @@ export default function AuthorsPage() {
         onClear={clearSelection}
         busy={bulkBusy}
         actions={[
-          { label: t('common.monitor'), onClick: () => runBulk('monitor') },
-          { label: t('common.unmonitor'), onClick: () => runBulk('unmonitor') },
+          { label: t('common.monitor'), onClick: () => openMonitoringBulk('monitor') },
+          { label: t('common.unmonitor'), onClick: () => openMonitoringBulk('unmonitor') },
           { label: t('common.search'), onClick: () => runBulk('search') },
           { label: t('authors.bulkRefreshMetadata', 'Refresh metadata'), onClick: () => runBulk('refresh') },
           { label: t('authors.bulkSetMonitorMode', 'Set monitor mode'), onClick: openBulkMonitorMode },
@@ -634,6 +677,55 @@ export default function AuthorsPage() {
           { label: t('common.delete'), onClick: () => runBulk('delete'), variant: 'danger' },
         ]}
       />
+
+      {monitoringBulkAction && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center p-4 z-50" onClick={() => setMonitoringBulkAction(null)}>
+          <div className="bg-slate-100 dark:bg-zinc-900 border border-slate-300 dark:border-zinc-700 rounded-lg w-full max-w-md shadow-2xl" role="dialog" aria-modal="true" aria-labelledby="bulk-monitoring-title" onClick={e => e.stopPropagation()}>
+            <div className="p-4 border-b border-slate-200 dark:border-zinc-800">
+              <h3 id="bulk-monitoring-title" className="text-lg font-semibold">
+                {monitoringBulkAction === 'monitor' ? t('common.monitor') : t('common.unmonitor')}
+              </h3>
+              <p className="text-xs text-slate-600 dark:text-zinc-400 mt-1">
+                {t('authors.bulkSetMonitorModeCount', {
+                  count: selectedIds.size,
+                  defaultValue: 'Selected authors: {{count}}',
+                })}
+              </p>
+            </div>
+            <div className="p-4">
+              <label className="flex items-start gap-2 text-sm cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={bulkApplyMonitoringToExisting}
+                  onChange={e => setBulkApplyMonitoringToExisting(e.target.checked)}
+                  disabled={bulkBusy}
+                  className="accent-emerald-500 mt-0.5 flex-shrink-0 disabled:opacity-50"
+                />
+                <span>
+                  <span className="font-medium">{t('authors.bulkApplyMonitoringToExisting', 'Also apply to their existing books')}</span>
+                  <span className="block text-xs text-slate-600 dark:text-zinc-400 mt-0.5">{t('authors.bulkApplyMonitoringToExistingHint', 'Rewrites every book of the selected authors to match. Leave it off to change the authors only.')}</span>
+                </span>
+              </label>
+            </div>
+            <div className="p-4 border-t border-slate-200 dark:border-zinc-800 flex justify-end gap-2">
+              <button
+                onClick={() => setMonitoringBulkAction(null)}
+                disabled={bulkBusy}
+                className="px-4 py-2 text-sm text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-white disabled:opacity-50"
+              >
+                {t('common.cancel', 'Cancel')}
+              </button>
+              <button
+                onClick={runMonitoringBulk}
+                disabled={bulkBusy}
+                className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed rounded-md text-sm font-medium text-white transition-colors"
+              >
+                {t('common.apply', 'Apply')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {showMonitorModeBulk && (
         <div className="fixed inset-0 bg-black/60 flex items-center justify-center p-4 z-50" onClick={closeBulkMonitorMode}>
